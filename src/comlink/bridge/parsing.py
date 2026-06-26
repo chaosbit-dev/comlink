@@ -12,9 +12,12 @@ from __future__ import annotations
 import email
 import email.header
 import email.policy
+import email.utils
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
+from email.utils import parseaddr
 from html.parser import HTMLParser
 from typing import Any, cast
 
@@ -362,4 +365,111 @@ def detail_from_message(
             ),
             "headers": headers,
         }
+    )
+
+
+# ---------------------------------------------------------------------------
+# RFC 5322 message construction + reply-header derivation (Epic 3, §6 Compose)
+#
+# Pure / no I/O: building a message and deriving reply headers from a parent's
+# raw bytes happen here; the actual APPEND/SMTP send live in bridge/imap.py and
+# bridge/smtp.py. stdlib EmailMessage does NOT auto-populate Message-ID or Date,
+# so we set them explicitly at build time (Echo intel).
+# ---------------------------------------------------------------------------
+
+_RE_PREFIX = re.compile(r"^\s*[Rr][Ee]\s*:")
+
+
+def _sender_domain(from_addr: str) -> str | None:
+    """Extract the domain from a ``From`` address for Message-ID generation.
+
+    Accepts both ``a@b.com`` and ``Name <a@b.com>``. Returns ``None`` when no
+    usable domain is present so :func:`email.utils.make_msgid` falls back to its
+    own default.
+    """
+    _name, addr_spec = parseaddr(from_addr)
+    if "@" in addr_spec:
+        domain = addr_spec.rsplit("@", 1)[1].strip()
+        if domain:
+            return domain
+    return None
+
+
+def build_message(
+    *,
+    from_addr: str,
+    to: list[str],
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    subject: str,
+    body_text: str,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+) -> EmailMessage:
+    """Build a single-part text/plain RFC 5322 message.
+
+    Message-ID and Date are set explicitly at build time (stdlib does not add
+    them automatically). The ``bcc`` recipients are deliberately NOT serialized
+    into a header — Bcc is carried only in the Python-side envelope list at send
+    time (see the caller in server.py / bridge.smtp) so recipients never see it.
+    """
+    msg = EmailMessage(policy=email.policy.default)
+    msg["From"] = from_addr
+    if to:
+        msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg["Subject"] = subject
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    msg["Message-ID"] = email.utils.make_msgid(domain=_sender_domain(from_addr))
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+    msg.set_content(body_text)
+    return msg
+
+
+@dataclass(slots=True)
+class ReplyHeaders:
+    """Derived reply headers for a draft/send replying to a parent message."""
+
+    in_reply_to: str | None
+    references: str | None
+    subject: str
+
+
+def _reply_subject(parent_subject: str) -> str:
+    """Single case-insensitive ``Re:`` prefix, no doubling (RFC 5322 §3.6.4 norm)."""
+    base = parent_subject.strip()
+    if _RE_PREFIX.match(base):
+        return base
+    return f"Re: {base}" if base else "Re:"
+
+
+def reply_headers_from(raw: bytes) -> ReplyHeaders:
+    """Derive (In-Reply-To, References, subject) for a reply to *raw*.
+
+    - ``In-Reply-To`` = the parent's Message-ID.
+    - ``References`` = the parent's existing References chain (if any) plus the
+      parent Message-ID; if the parent had no References, just its Message-ID.
+    - ``subject`` = parent subject with a single ``Re:`` prefix (reusing an
+      existing one rather than doubling it).
+    """
+    parent = parse_email(raw)
+    parent_id = str(parent["Message-ID"]).strip() if parent["Message-ID"] is not None else ""
+    existing_refs = str(parent["References"]).strip() if parent["References"] is not None else ""
+    if parent_id and existing_refs:
+        references: str | None = f"{existing_refs} {parent_id}"
+    elif parent_id:
+        references = parent_id
+    elif existing_refs:
+        references = existing_refs
+    else:
+        references = None
+    subject = _reply_subject(decode_header_value(parent["Subject"]))
+    return ReplyHeaders(
+        in_reply_to=parent_id or None,
+        references=references,
+        subject=subject,
     )

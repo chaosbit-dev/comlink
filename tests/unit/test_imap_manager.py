@@ -3,118 +3,33 @@ mailbox resolution, pagination, All Mail exclusion (§3, §9)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
-
 import pytest
-from imapclient.exceptions import LoginError
 
-import comlink.bridge.imap as imap_module
-from comlink.bridge.imap import ImapConnectionManager, build_search_criteria
-from comlink.errors import AuthFailed, BridgeUnavailable, ComlinkError, ConfigError, FolderNotFound
+from comlink.bridge.imap import (
+    DELETED_FLAG,
+    FLAGGED_FLAG,
+    SEEN_FLAG,
+    ImapConnectionManager,
+    build_search_criteria,
+)
+from comlink.errors import (
+    AuthFailed,
+    BridgeUnavailable,
+    ComlinkError,
+    ConfigError,
+    FolderNotFound,
+    InvalidTarget,
+)
 
 from ..conftest import make_settings
+from .conftest import (
+    DEFAULT_FOLDERS,
+    FakeBridgeState,
+    FakeIMAPClient,
+    make_manager,
+)
 
-DEFAULT_FOLDERS: list[tuple[tuple[bytes, ...], str]] = [
-    ((), "INBOX"),
-    ((), "Sent"),
-    ((), "All Mail"),
-    ((), "Folders/receipts"),
-    ((), "Labels/news"),
-    ((b"\\Noselect",), "Folders"),
-]
-
-
-@dataclass
-class FakeBridgeState:
-    folders: list[tuple[tuple[bytes, ...], str]] = field(
-        default_factory=lambda: list(DEFAULT_FOLDERS)
-    )
-    counts: dict[str, tuple[int, int]] = field(default_factory=dict)
-    search_uids: dict[str, list[int]] = field(default_factory=dict)
-    raw_messages: dict[tuple[str, int], bytes] = field(default_factory=dict)
-    refuse_connection: bool = False
-    fail_login: bool = False
-    drop_ops: int = 0  # raise OSError on this many subsequent operations
-    clients: list[FakeIMAPClient] = field(default_factory=list)
-
-
-class FakeIMAPClient:
-    def __init__(self, state: FakeBridgeState) -> None:
-        self.state = state
-        self.selected: str | None = None
-        self.selects: list[tuple[str, bool]] = []
-        self.starttls_called = False
-        self.logged_in = False
-        self.shutdown_called = False
-
-    def _maybe_drop(self) -> None:
-        if self.state.drop_ops > 0:
-            self.state.drop_ops -= 1
-            raise OSError("connection dropped")
-
-    def starttls(self, ssl_context: object) -> None:
-        self.starttls_called = True
-
-    def login(self, username: str, password: str) -> None:
-        if self.state.fail_login:
-            raise LoginError("LOGIN command error: BAD credentials")
-        self.logged_in = True
-
-    def list_folders(self) -> list[tuple[tuple[bytes, ...], bytes, str]]:
-        self._maybe_drop()
-        return [(flags, b"/", name) for flags, name in self.state.folders]
-
-    def folder_status(self, name: str, what: list[bytes]) -> dict[bytes, int]:
-        messages, unseen = self.state.counts.get(name, (0, 0))
-        return {b"MESSAGES": messages, b"UNSEEN": unseen}
-
-    def select_folder(self, name: str, readonly: bool = False) -> dict[bytes, Any]:
-        self._maybe_drop()
-        self.selected = name
-        self.selects.append((name, readonly))
-        return {}
-
-    def search(self, criteria: list[Any]) -> list[int]:
-        assert self.selected is not None
-        return list(self.state.search_uids.get(self.selected, []))
-
-    def fetch(self, uids: list[int], keys: list[bytes]) -> dict[int, dict[bytes, Any]]:
-        assert self.selected is not None
-        result: dict[int, dict[bytes, Any]] = {}
-        for uid in uids:
-            if b"BODY.PEEK[]" in keys:
-                raw = self.state.raw_messages.get((self.selected, uid))
-                if raw is not None:
-                    result[uid] = {b"BODY[]": raw, b"FLAGS": (b"\\Seen",)}
-            else:
-                result[uid] = {b"FLAGS": (), b"RFC822.SIZE": 100 + uid}
-        return result
-
-    def shutdown(self) -> None:
-        self.shutdown_called = True
-
-    def logout(self) -> None:
-        self.shutdown_called = True
-
-
-@pytest.fixture
-def bridge(monkeypatch: pytest.MonkeyPatch) -> FakeBridgeState:
-    state = FakeBridgeState()
-
-    def factory(host: str, port: int = 143, ssl: bool = True, timeout: int | None = None) -> Any:
-        if state.refuse_connection:
-            raise ConnectionRefusedError("connection refused")
-        client = FakeIMAPClient(state)
-        state.clients.append(client)
-        return client
-
-    monkeypatch.setattr(imap_module, "IMAPClient", factory)
-    return state
-
-
-def make_manager() -> ImapConnectionManager:
-    return ImapConnectionManager(make_settings())
+__all__ = ["DEFAULT_FOLDERS", "FakeBridgeState", "FakeIMAPClient", "make_manager"]
 
 
 class TestConnectionLifecycle:
@@ -300,3 +215,137 @@ class TestSearchCriteria:
     def test_invalid_date_is_actionable(self) -> None:
         with pytest.raises(ComlinkError, match="ISO date"):
             build_search_criteria(since="June 1st")
+
+
+class TestMoveMessages:
+    async def test_copy_then_mark_deleted_no_expunge(self, bridge: FakeBridgeState) -> None:
+        manager = make_manager()
+        result = await manager.move_messages("INBOX", "receipts", [10, 11])
+        assert result.succeeded == [10, 11]
+        assert result.failed == []
+        # Source selected non-readonly (first non-readonly select in the codebase).
+        assert bridge.clients[0].selects == [("INBOX", False)]
+        # COPY into the resolved raw destination, never move()/expunge().
+        assert bridge.copies == [([10], "Folders/receipts"), ([11], "Folders/receipts")]
+        assert bridge.added_flags == [([10], [DELETED_FLAG]), ([11], [DELETED_FLAG])]
+        assert bridge.moves == []
+        assert bridge.expunges == 0
+
+    async def test_label_destination_rejected_with_zero_mutations(
+        self, bridge: FakeBridgeState
+    ) -> None:
+        manager = make_manager()
+        with pytest.raises(InvalidTarget, match="label, not a folder"):
+            await manager.move_messages("INBOX", "news", [1, 2])
+        # No server-side mutation occurred — rejection happens before any COPY/select.
+        assert bridge.copies == []
+        assert bridge.added_flags == []
+        assert bridge.clients[0].selects == []
+
+    async def test_partial_success_reported(self, bridge: FakeBridgeState) -> None:
+        bridge.fail_copy_uids = {11}
+        manager = make_manager()
+        result = await manager.move_messages("INBOX", "receipts", [10, 11, 12])
+        assert result.succeeded == [10, 12]
+        assert [item.uid for item in result.failed] == [11]
+        assert result.failed[0].ok is False
+        assert result.failed[0].error
+
+
+class TestMarkMessages:
+    @pytest.mark.parametrize(
+        ("mark", "flag", "added"),
+        [
+            ("read", SEEN_FLAG, True),
+            ("unread", SEEN_FLAG, False),
+            ("flagged", FLAGGED_FLAG, True),
+            ("unflagged", FLAGGED_FLAG, False),
+        ],
+    )
+    async def test_flag_mapping(
+        self, bridge: FakeBridgeState, mark: str, flag: bytes, added: bool
+    ) -> None:
+        bridge.search_uids["INBOX"] = []
+        manager = make_manager()
+        result = await manager.mark_messages("INBOX", [7], mark)  # type: ignore[arg-type]
+        assert result.succeeded == [7]
+        assert bridge.clients[0].selects == [("INBOX", False)]
+        if added:
+            assert bridge.added_flags == [([7], [flag])]
+            assert bridge.removed_flags == []
+        else:
+            assert bridge.removed_flags == [([7], [flag])]
+            assert bridge.added_flags == []
+
+
+class TestMoveToTrash:
+    async def test_moves_to_trash_via_copy(self, bridge: FakeBridgeState) -> None:
+        bridge.folders.append(((), "Trash"))
+        manager = make_manager()
+        result = await manager.move_to_trash("INBOX", [3])
+        assert result.succeeded == [3]
+        assert bridge.copies == [([3], "Trash")]
+        assert bridge.added_flags == [([3], [DELETED_FLAG])]
+        assert bridge.expunges == 0
+
+    async def test_delete_from_trash_refused(self, bridge: FakeBridgeState) -> None:
+        bridge.folders.append(((), "Trash"))
+        manager = make_manager()
+        with pytest.raises(InvalidTarget, match="protected"):
+            await manager.move_to_trash("Trash", [3])
+        assert bridge.copies == []
+        assert bridge.added_flags == []
+
+    async def test_delete_from_spam_refused(self, bridge: FakeBridgeState) -> None:
+        bridge.folders.append(((), "Spam"))
+        bridge.folders.append(((), "Trash"))
+        manager = make_manager()
+        with pytest.raises(InvalidTarget, match="protected"):
+            await manager.move_to_trash("Spam", [3])
+        assert bridge.copies == []
+
+
+class TestCreateMailbox:
+    async def test_create_folder_namespace(self, bridge: FakeBridgeState) -> None:
+        manager = make_manager()
+        raw, parent = await manager.create_mailbox("puppy", "folder")
+        assert raw == "Folders/puppy"
+        assert parent is None
+        assert bridge.created_folders == ["Folders/puppy"]
+
+    async def test_create_label_namespace(self, bridge: FakeBridgeState) -> None:
+        manager = make_manager()
+        raw, parent = await manager.create_mailbox("vip", "label")
+        assert raw == "Labels/vip"
+        assert parent is None
+        assert bridge.created_folders == ["Labels/vip"]
+
+    async def test_create_nested_folder_uses_delimiter(self, bridge: FakeBridgeState) -> None:
+        manager = make_manager()
+        raw, parent = await manager.create_mailbox("hera", "folder", parent="receipts")
+        assert raw == "Folders/receipts/hera"
+        assert parent == "receipts"
+
+    async def test_nesting_under_label_rejected(self, bridge: FakeBridgeState) -> None:
+        manager = make_manager()
+        with pytest.raises(InvalidTarget, match="not a folder"):
+            await manager.create_mailbox("x", "folder", parent="news")
+        assert bridge.created_folders == []
+
+    async def test_already_exists_locally_is_actionable(self, bridge: FakeBridgeState) -> None:
+        manager = make_manager()
+        with pytest.raises(InvalidTarget, match="already exists"):
+            await manager.create_mailbox("receipts", "folder")
+        assert bridge.created_folders == []
+
+    async def test_server_already_exists_mapped(self, bridge: FakeBridgeState) -> None:
+        bridge.create_error = "ALREADYEXISTS mailbox already exists"
+        manager = make_manager()
+        with pytest.raises(InvalidTarget, match="already exists"):
+            await manager.create_mailbox("brandnew", "folder")
+
+    async def test_other_create_error_is_comlink_error(self, bridge: FakeBridgeState) -> None:
+        bridge.create_error = "BAD invalid mailbox name"
+        manager = make_manager()
+        with pytest.raises(ComlinkError, match="valid Proton mailbox names"):
+            await manager.create_mailbox("brandnew", "folder")
