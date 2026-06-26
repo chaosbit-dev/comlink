@@ -66,9 +66,52 @@ class FolderNotFound(ComlinkError):
 class InvalidTarget(ComlinkError):
     """Operation targeted the wrong kind of mailbox (e.g. moving into a label)."""
 
+    @classmethod
+    def label_move(cls, name: str) -> InvalidTarget:
+        return cls(
+            f"'{name}' is a label, not a folder — messages can't be moved into labels. "
+            "Labels coexist with folders in Proton. Use proton_label_messages (v1.1) or "
+            "apply the label in a Proton client."
+        )
+
+    @classmethod
+    def delete_from_protected(cls, folder: str) -> InvalidTarget:
+        return cls(
+            f"Refusing to delete from '{folder}': Trash and Spam are protected — delete "
+            "already means 'move to Trash', and there is no further safe destination. To "
+            "empty Trash or Spam, use a Proton client (web or iOS)."
+        )
+
 
 class SendBlocked(ComlinkError):
-    """A send guardrail (gate, allowlist, or rate limit) blocked the operation."""
+    """A send guardrail (gate, allowlist, or rate limit) blocked the operation.
+
+    Each factory names the specific guardrail that fired and how to change it (§8).
+    """
+
+    @classmethod
+    def not_allowlisted(cls, addr: str) -> SendBlocked:
+        return cls(
+            f"Recipient {addr} not in COMLINK_SEND_ALLOWLIST. Add the address (or a "
+            "'*@domain' wildcard) to COMLINK_SEND_ALLOWLIST, or leave the allowlist empty "
+            "to permit any recipient (not recommended)."
+        )
+
+    @classmethod
+    def rate_limited(cls, max_per_hour: int, retry_after: int) -> SendBlocked:
+        return cls(
+            f"Send rate limit reached: {max_per_hour} message(s) per hour "
+            "(COMLINK_SEND_MAX_PER_HOUR). Wait about "
+            f"{retry_after} second(s) and retry, or raise COMLINK_SEND_MAX_PER_HOUR."
+        )
+
+    @classmethod
+    def confirm_not_asserted(cls) -> SendBlocked:
+        return cls(
+            "Send blocked: confirm must be set to true to send. proton_send_message will "
+            "not send without an explicit confirm=true — set it only when a human has "
+            "approved this exact outbound message, or use proton_save_draft instead."
+        )
 
 
 class UidStale(ComlinkError):

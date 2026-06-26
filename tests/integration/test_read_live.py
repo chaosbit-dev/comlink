@@ -17,6 +17,7 @@ import pytest
 from comlink.bridge.imap import ImapConnectionManager
 from comlink.bridge.parsing import UNTRUSTED_CONTENT_MARKER
 from comlink.config import ComlinkSettings
+from comlink.guardrails import RateLimiter
 from comlink.server import (
     get_message_impl,
     health_check_impl,
@@ -32,7 +33,7 @@ class TestHealthCheck:
     async def test_health_check_reports_bridge_status(
         self, settings: ComlinkSettings, imap: ImapConnectionManager
     ) -> None:
-        report = await health_check_impl(settings, imap)
+        report = await health_check_impl(settings, imap, RateLimiter())
         assert report["imap"]["ok"] is True, report["imap"].get("error")
         assert report["smtp"]["ok"] is True, report["smtp"].get("error")
         assert report["bridge_reachable"] is True

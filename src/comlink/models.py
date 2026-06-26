@@ -73,6 +73,64 @@ class MessageDetail(ComlinkModel):
     headers: dict[str, str] | None = None
 
 
+class UidResult(ComlinkModel):
+    """Per-UID outcome of an organize op. Captures partial success (§6 Organize).
+
+    ``error`` carries failure text on ``ok=False`` entries (e.g. a failed COPY).
+    ``warning`` carries an advisory note on ``ok=True`` entries — used when an op
+    succeeded in its load-bearing step but a best-effort follow-up did not (e.g.
+    COPY succeeded but the source ``\\Deleted`` flag could not be set; the move
+    still happened, so the UID is reported ok with a warning rather than failed,
+    which would invite a duplicate-creating retry — §6 truthfulness, §3.5).
+    """
+
+    uid: int
+    ok: bool
+    error: str | None = None
+    warning: str | None = None
+
+
+class BatchResult(ComlinkModel):
+    """Aggregate of a per-UID organize op over one folder.
+
+    ``succeeded``/``failed`` are kept separate so partial success is never
+    collapsed to a single boolean (§6 Organize, §10 Epic 2 acceptance).
+    ``warnings`` holds ``ok=True`` UidResults whose primary step succeeded but a
+    best-effort follow-up did not; those UIDs are also present in ``succeeded``
+    (the move happened) — the warning is advisory only, never a failure.
+    """
+
+    folder: str
+    succeeded: list[int] = Field(default_factory=list)
+    failed: list[UidResult] = Field(default_factory=list)
+    warnings: list[UidResult] = Field(default_factory=list)
+
+
+class FolderCreated(ComlinkModel):
+    """Result of proton_create_folder (§6 Organize)."""
+
+    name: str
+    kind: MailboxKind
+    raw: str
+    parent: str | None = None
+
+
+class DraftCreated(ComlinkModel):
+    """Result of proton_save_draft (§6 Compose)."""
+
+    uid: int
+    folder: str = "Drafts"
+    subject: str = ""
+    message_id: str
+
+
+class SendResult(ComlinkModel):
+    """Result of proton_send_message (§6 Compose, §7 gated send)."""
+
+    message_id: str
+    recipients: list[str] = Field(default_factory=list)
+
+
 class SendGateStatus(ComlinkModel):
     enabled: bool
     allowlist_size: int
