@@ -45,11 +45,25 @@ def delete_audit_entry(folder: str, succeeded: list[int], failed: list[int]) -> 
     }
 
 
-def send_audit_entry(recipients: list[str], subject: str, message_id: str) -> dict[str, Any]:
-    """Build the send audit entry. No body, no password, no secrets (§7.4)."""
+# Requesting-context tag for the send audit (§6). Static "stdio" for the Phase 1
+# local transport; forward-compatible for the Phase 2 remote transport, where this
+# becomes the authenticated OAuth subject. Never carries a secret or the body.
+SEND_TRANSPORT = "stdio"
+
+
+def send_audit_entry(
+    recipients: list[str], subject: str, message_id: str, transport: str = SEND_TRANSPORT
+) -> dict[str, Any]:
+    """Build the send audit entry. No body, no password, no secrets (§7.4).
+
+    ``transport`` is the design-§6 "requesting context": the channel the send came
+    in on. It is a non-secret tag (default ``"stdio"``) — under the Phase 2 remote
+    transport it will carry the OAuth subject instead.
+    """
     return {
         "ts": audit_timestamp(),
         "action": "send",
+        "transport": transport,
         "recipients": list(recipients),
         "subject": subject,
         "message_id": message_id,

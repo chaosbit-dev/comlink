@@ -110,9 +110,9 @@ class TestDeleteAudit:
         manager = FakeManager()
         payload = await delete_messages_impl(
             settings,
-            manager,
+            manager,  # type: ignore[arg-type]
             uids=[1, 2],
-            folder="INBOX",  # type: ignore[arg-type]
+            folder="INBOX",
         )
         assert payload["destination"] == "Trash"
         entries = _read_audit(tmp_path / "audit.jsonl")
@@ -129,9 +129,9 @@ class TestDeleteAudit:
         with pytest.raises(InvalidTarget, match="protected"):
             await delete_messages_impl(
                 settings,
-                manager,
+                manager,  # type: ignore[arg-type]
                 uids=[1],
-                folder="Trash",  # type: ignore[arg-type]
+                folder="Trash",
             )
         assert _read_audit(tmp_path / "audit.jsonl") == []
 

@@ -124,6 +124,22 @@ class UidStale(ComlinkError):
             "proton_list_messages and retry with fresh UIDs."
         )
 
+    @classmethod
+    def for_uid(cls, uid: int, folder: str) -> UidStale:
+        """Per-UID variant for write ops (move/delete/mark).
+
+        A UID the caller learned from an earlier list/search is no longer present
+        in the freshly re-selected mailbox — the UIDVALIDITY context that produced
+        it is stale (Bridge restart/resync, §3.5) or the message already moved. No
+        other message was touched.
+        """
+        return cls(
+            f"UID {uid} is not present in {folder} (UIDVALIDITY changed or the "
+            "message already moved). No other message was touched. Re-run "
+            "proton_list_messages or proton_search_messages to get fresh UIDs, "
+            "then retry."
+        )
+
 
 def redact(text: str, secrets: Iterable[str | None]) -> str:
     """Scrub every secret out of *text* before it leaves the server.

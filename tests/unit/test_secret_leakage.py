@@ -20,11 +20,12 @@ import comlink.bridge.smtp as smtp_module
 from comlink.config import ComlinkSettings
 from comlink.errors import ComlinkError, redact, redacted_message
 from comlink.guardrails import RateLimiter, send_audit_entry
-from comlink.server import _raw_secrets, send_message_impl
+from comlink.server import _raw_secrets, health_check_impl, send_message_impl
 
 from ..conftest import make_settings
 
 _PASSWORD = "sup3r-s3cret-bridge-pw"
+_CMD_SECRET = "sup3r-cmd-s3cret-from-keychain"
 _BODY = "MEETING NOTES: the merger closes Friday, do not forward."
 
 
@@ -81,6 +82,40 @@ class TestPasswordRedaction:
         settings = make_settings(username="x@y.com", password=_PASSWORD)
         assert _PASSWORD in [s for s in _raw_secrets(settings) if s]
 
+    def test_raw_secrets_includes_command_derived_secret(self) -> None:
+        # When the credential comes from COMLINK_PASSWORD_COMMAND, settings.password
+        # is None — the redaction set must still carry the resolved secret (Crosshair #3).
+        settings = make_settings(
+            username="x@y.com",
+            password=None,
+            password_command=f"printf %s {_CMD_SECRET}",
+        )
+        assert _CMD_SECRET in [s for s in _raw_secrets(settings) if s]
+
+    async def test_command_secret_redacted_in_health_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A health-check exception that echoes the COMMAND-derived password must be
+        # scrubbed even though settings.password is None.
+        async def fake_smtp(settings: ComlinkSettings, password: str) -> None:
+            raise ComlinkError("smtp unreachable")  # no secret; keeps the test focused
+
+        monkeypatch.setattr("comlink.server.verify_smtp_connectivity", fake_smtp)
+
+        class _LeakyImap:
+            async def verify_connectivity(self) -> int:
+                raise RuntimeError(f"bridge said: bad creds {_CMD_SECRET}")
+
+        settings = make_settings(
+            username="brandon@chaosbit.dev",
+            password=None,
+            password_command=f"printf %s {_CMD_SECRET}",
+        )
+        report = await health_check_impl(settings, _LeakyImap(), RateLimiter())  # type: ignore[arg-type]
+        error_text = report["imap"]["error"]
+        assert _CMD_SECRET not in error_text
+        assert "[REDACTED]" in error_text
+
 
 class TestAuditNoBodyNoSecret:
     def test_send_audit_entry_excludes_body_and_password(self) -> None:
@@ -92,6 +127,15 @@ class TestAuditNoBodyNoSecret:
         assert entry["recipients"] == ["kendra@chaosbit.dev"]
         assert entry["subject"] == "Subject line"
         assert entry["message_id"] == "<id@chaosbit.dev>"
+
+    def test_send_audit_entry_carries_transport_but_no_secrets(self) -> None:
+        # Crosshair #2: the audit entry records "requesting context" (transport) and
+        # still carries no body and no credentials (§6, §7.4).
+        entry = send_audit_entry(["kendra@chaosbit.dev"], "Subject line", "<id@chaosbit.dev>")
+        assert entry["transport"] == "stdio"
+        flat = json.dumps(entry).lower()
+        assert "body" not in flat
+        assert "password" not in flat
 
     async def test_full_send_audit_line_has_no_body_no_password(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -52,6 +52,9 @@ class FakeBridgeState:
     removed_flags: list[tuple[list[int], list[bytes]]] = field(default_factory=list)
     created_folders: list[str] = field(default_factory=list)
     fail_copy_uids: set[int] = field(default_factory=set)
+    # UIDs the mailbox no longer contains — a freshly re-selected SELECT/FETCH won't
+    # return them, modelling a stale UID after a UIDVALIDITY change (§3.5).
+    absent_uids: set[int] = field(default_factory=set)
     create_error: str | None = None
     # APPEND recorder (Epic 3 drafts): (mailbox, raw_bytes, flags).
     appended: list[tuple[str, bytes, list[bytes]]] = field(default_factory=list)
@@ -63,6 +66,11 @@ class FakeBridgeState:
     drop_on_copy_uids: set[int] = field(default_factory=set)
     # UIDs whose \Deleted add_flags raises this IMAP error text (COPY-ok/STORE-fail).
     store_error_text: dict[int, str] = field(default_factory=dict)
+    # Raise OSError this many times on the _present_uids presence FETCH (keys==[FLAGS])
+    # before succeeding — models a connection drop on the pre-mutation presence check
+    # (§3.5). The reconnect-replay in _call_sync must re-run the whole op without
+    # double-mutating, because the drop happens before any COPY/STORE.
+    present_fetch_drops: int = 0
 
 
 class FakeIMAPClient:
@@ -113,8 +121,15 @@ class FakeIMAPClient:
 
     def fetch(self, uids: list[int], keys: list[bytes]) -> dict[int, dict[bytes, Any]]:
         assert self.selected is not None
+        if keys == [b"FLAGS"] and self.state.present_fetch_drops > 0:
+            # Drop on the _present_uids presence check, before any mutation (§3.5).
+            self.state.present_fetch_drops -= 1
+            raise OSError("connection dropped during presence FETCH")
         result: dict[int, dict[bytes, Any]] = {}
         for uid in uids:
+            if uid in self.state.absent_uids:
+                # Stale UID: absent from the freshly re-selected mailbox (§3.5).
+                continue
             if b"BODY.PEEK[]" in keys:
                 raw = self.state.raw_messages.get((self.selected, uid))
                 if raw is not None:

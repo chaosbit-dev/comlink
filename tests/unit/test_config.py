@@ -66,6 +66,20 @@ class TestPasswordResolution:
         assert "sup3r-secret" not in str(excinfo.value)
         assert "[REDACTED]" in str(excinfo.value)
 
+    def test_command_failure_redacts_command_derived_secret_from_stderr(self) -> None:
+        # Epic 4 finding 2: the COMMAND is the credential source (no static password),
+        # so the resolved secret is the command's stdout. A command that echoes that
+        # secret to stderr before failing must not surface it — stderr is redacted
+        # against the command's own stdout, not just the (here-None) static password.
+        settings = make_settings(
+            password=None,
+            password_command="printf 'cmd-sup3r-secret'; printf 'cmd-sup3r-secret' >&2; exit 1",
+        )
+        with pytest.raises(ConfigError) as excinfo:
+            settings.resolve_password()
+        assert "cmd-sup3r-secret" not in str(excinfo.value)
+        assert "[REDACTED]" in str(excinfo.value)
+
     def test_no_password_at_all_is_config_error(self) -> None:
         settings = make_settings(password=None, password_command=None)
         with pytest.raises(ConfigError, match="COMLINK_PASSWORD"):

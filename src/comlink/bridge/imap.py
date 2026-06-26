@@ -33,6 +33,7 @@ from comlink.errors import (
     ConfigError,
     FolderNotFound,
     InvalidTarget,
+    UidStale,
     redact,
 )
 from comlink.models import BatchResult, MailboxKind, UidResult
@@ -373,11 +374,10 @@ class ImapConnectionManager:
             data = fetched.get(uid)
             body = data.get(b"BODY[]") if data else None
             if not isinstance(body, bytes):
-                raise ComlinkError(
-                    f"UID {uid} not found in '{entry.name}'. UIDs are only valid within "
-                    "the session that produced them — re-run proton_list_messages and "
-                    "retry with a fresh UID."
-                )
+                # The freshly re-selected mailbox has no such message: the caller's
+                # UID is stale (UIDVALIDITY changed, §3.5) rather than merely a bad
+                # number. Map to UidStale guidance — §8 canonical message.
+                raise UidStale.for_folder(entry.name)
             return entry.name, body, (data or {}).get(b"FLAGS", ())
 
         return await self._call(op)
@@ -392,13 +392,47 @@ class ImapConnectionManager:
     # explicit COPY + STORE \Deleted and rely on Bridge/Proton to reconcile the
     # \Deleted source copies. expunge() is never called anywhere in this codebase.
 
+    @staticmethod
+    def _present_uids(client: Any, uids: list[int]) -> set[int]:
+        """Return the subset of *uids* that exist in the currently selected mailbox.
+
+        A freshly re-selected mailbox is the only context in which the caller's UIDs
+        are meaningful (§3.5). A UID the caller learned from an earlier list/search
+        whose UIDVALIDITY context is now stale (Bridge restart/resync) will simply be
+        absent from this FETCH — the calling write op maps that absence to UidStale
+        guidance and performs no mutation against any other UID. The FETCH precedes
+        every mutation, so a connection drop here replays safely via _call_sync.
+
+        # DESIGN-GAP (Open Question A — minimal scheme only): this presence check
+        # detects a stale UID that is now *absent*, but CANNOT detect a stale UID
+        # whose number now coincidentally maps to a DIFFERENT existing message after
+        # a UIDVALIDITY change — that op would still act on the wrong message. That
+        # residual-corruption risk is closed only by the deferred richer scheme:
+        # returning the UIDVALIDITY token in list/search responses and requiring the
+        # caller to echo it back on write ops for true cross-call validation. That is
+        # a response-schema change, deferred to a later epic.
+        """
+        if not uids:
+            return set()
+        fetched: dict[int, dict[bytes, Any]] = client.fetch(uids, [b"FLAGS"])
+        return set(fetched)
+
     def _copy_and_mark_deleted(
         self, client: Any, source: MailboxEntry, destination_raw: str, uids: list[int]
     ) -> BatchResult:
         """COPY uids from the (selected) source into *destination_raw*, then flag
         the source copies \\Deleted. Per-UID so partial failures are reported.
 
-        Three subtleties, each load-bearing:
+        A UID absent from the freshly re-selected source is reported as a per-UID
+        UidStale failure (§3.5) and skipped — no COPY, no \\Deleted STORE, no mutation
+        of any other message. Consistent with the partial-success model: an absent
+        UID in a batch never aborts the whole batch; the present UIDs still move.
+
+        Four subtleties, each load-bearing:
+
+        - A stale/absent UID must not act on the wrong message. Presence is verified
+          up front (one FETCH on the freshly selected mailbox) before any COPY, so a
+          UID the caller carried over from a stale selection is rejected, not acted on.
 
         - COPY and the \\Deleted STORE are caught separately (§6 truthfulness). A
           *failed COPY* is a real failure (the message did not move) and leaves
@@ -419,7 +453,16 @@ class ImapConnectionManager:
           next *tool call* reconnects cleanly.
         """
         result = BatchResult(folder=source.name)
+        present = self._present_uids(client, uids)
         for uid in uids:
+            if uid not in present:
+                # Stale/absent UID (§3.5): re-selected mailbox has no such message.
+                # Per-UID failure with UidStale guidance; NO COPY/STORE is issued, so
+                # no other message is mutated. The batch continues for present UIDs.
+                result.failed.append(
+                    UidResult(uid=uid, ok=False, error=str(UidStale.for_uid(uid, source.name)))
+                )
+                continue
             try:
                 client.copy([uid], destination_raw)
             except imaplib.IMAP4.error as exc:
@@ -493,14 +536,27 @@ class ImapConnectionManager:
         return await self._call(op)
 
     async def mark_messages(self, folder: str, uids: list[int], mark: MarkAction) -> BatchResult:
-        """Add or remove the \\Seen / \\Flagged flag on *uids*. Idempotent."""
+        """Add or remove the \\Seen / \\Flagged flag on *uids*. Idempotent.
+
+        A UID absent from the freshly re-selected mailbox is reported as a per-UID
+        UidStale failure (§3.5) and its flag is never touched — consistent with the
+        partial-success model: an absent UID never aborts the batch, the present
+        UIDs are still flagged.
+        """
         flag, add = _MARK_OPS[mark]
 
         def op(client: Any) -> BatchResult:
             entry = self._resolve_sync(client, folder)
             client.select_folder(entry.raw, readonly=False)
             result = BatchResult(folder=entry.name)
+            present = self._present_uids(client, uids)
             for uid in uids:
+                if uid not in present:
+                    # Stale/absent UID (§3.5): no STORE issued against any UID.
+                    result.failed.append(
+                        UidResult(uid=uid, ok=False, error=str(UidStale.for_uid(uid, entry.name)))
+                    )
+                    continue
                 try:
                     if add:
                         client.add_flags([uid], [flag], silent=True)

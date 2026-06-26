@@ -116,12 +116,26 @@ class FolderCreated(ComlinkModel):
 
 
 class DraftCreated(ComlinkModel):
-    """Result of proton_save_draft (§6 Compose)."""
+    """Result of proton_save_draft (§6 Compose).
+
+    ``bcc_dropped`` surfaces a deliberate data-loss semantic: a draft has no SMTP
+    envelope, and build_message never serializes a Bcc header (so Bcc can't leak to
+    To/Cc recipients — §6, Bcc-never-in-header). A draft saved with a Bcc-only
+    recipient therefore cannot carry that recipient anywhere, so it is dropped rather
+    than silently swallowed. This field lists ONLY the genuinely-dropped Bcc
+    addresses: a Bcc address that is also a To or Cc recipient is still delivered via
+    its visible header and is excluded from the list (case-insensitive match,
+    de-duplicated within Bcc, original order preserved). The list is empty when no
+    Bcc recipient is lost. The caller can warn the user or re-send via
+    proton_send_message, which honors Bcc through the envelope. The draft is never
+    rejected over Bcc.
+    """
 
     uid: int
     folder: str = "Drafts"
     subject: str = ""
     message_id: str
+    bcc_dropped: list[str] = Field(default_factory=list)
 
 
 class SendResult(ComlinkModel):

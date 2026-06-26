@@ -66,6 +66,38 @@ class TestBccLeakage:
         assert b"bcc:" not in lowered
         assert _SECRET_BCC.encode() not in raw
 
+
+class TestDraftBccDataLossWarning:
+    async def test_draft_with_bcc_reports_dropped_and_serializes_no_header(self) -> None:
+        # Crosshair #4: a draft has no envelope and Bcc is never serialized, so Bcc
+        # recipients are dropped — surfaced explicitly, never silently lost.
+        settings = make_settings(username="brandon@chaosbit.dev")
+        manager = _FakeDraftManager()
+        payload = await save_draft_impl(
+            settings,
+            manager,  # type: ignore[arg-type]
+            to=["kendra@chaosbit.dev"],
+            bcc=[_SECRET_BCC, "second@chaosbit.dev"],
+            subject="quiet",
+            body_text="x",
+        )
+        assert payload["bcc_dropped"] == [_SECRET_BCC, "second@chaosbit.dev"]
+        raw = manager.appended[0][0]
+        assert b"bcc:" not in raw.lower()
+        assert _SECRET_BCC.encode() not in raw
+
+    async def test_draft_without_bcc_reports_empty_list(self) -> None:
+        settings = make_settings(username="brandon@chaosbit.dev")
+        manager = _FakeDraftManager()
+        payload = await save_draft_impl(
+            settings,
+            manager,  # type: ignore[arg-type]
+            to=["kendra@chaosbit.dev"],
+            subject="quiet",
+            body_text="x",
+        )
+        assert payload["bcc_dropped"] == []
+
     async def test_send_message_bytes_have_no_bcc_header(
         self, tmp_path: Any, captured_send: list[dict[str, Any]]
     ) -> None:
