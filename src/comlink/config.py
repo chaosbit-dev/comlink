@@ -82,7 +82,15 @@ class ComlinkSettings(BaseSettings):
                     "non-interactively (e.g. the Keychain item is accessible)."
                 ) from exc
             if result.returncode != 0:
-                stderr = redact(result.stderr.strip(), [self._raw_password()])
+                # Epic 4 finding 2: when the COMMAND is the credential source,
+                # self._raw_password() is None, so redacting stderr against it alone
+                # would scrub nothing. The resolved secret is whatever the command
+                # printed to stdout, so redact stderr against that too — a command that
+                # echoes its secret to stderr before failing must not surface it here.
+                stderr = redact(
+                    result.stderr.strip(),
+                    [self._raw_password(), result.stdout.strip()],
+                )
                 raise ConfigError(
                     f"COMLINK_PASSWORD_COMMAND exited with status {result.returncode}"
                     + (f": {stderr}" if stderr else "")

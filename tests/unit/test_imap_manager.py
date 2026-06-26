@@ -19,6 +19,7 @@ from comlink.errors import (
     ConfigError,
     FolderNotFound,
     InvalidTarget,
+    UidStale,
 )
 
 from ..conftest import make_settings
@@ -193,6 +194,81 @@ class TestFetchRawMessage:
         manager = make_manager()
         with pytest.raises(ComlinkError, match="proton_list_messages"):
             await manager.fetch_raw_message("INBOX", 999)
+
+    async def test_absent_uid_maps_to_uid_stale(self, bridge: FakeBridgeState) -> None:
+        # §3.5: an absent UID on a freshly re-selected mailbox is stale, not a bare
+        # "not found" — it must surface UidStale guidance, not generic ComlinkError.
+        manager = make_manager()
+        with pytest.raises(UidStale, match="UIDVALIDITY changed"):
+            await manager.fetch_raw_message("INBOX", 999)
+
+
+class TestStaleUidWrites:
+    """A stale/absent UID on a write op must surface UidStale and mutate nothing
+    else — the silent-corruption guard of §3.5 (Epic 4)."""
+
+    async def test_single_move_absent_uid_mutates_nothing(self, bridge: FakeBridgeState) -> None:
+        bridge.absent_uids = {11}
+        manager = make_manager()
+        result = await manager.move_messages("INBOX", "receipts", [11])
+        assert result.succeeded == []
+        assert [item.uid for item in result.failed] == [11]
+        assert result.failed[0].ok is False
+        assert "not present" in (result.failed[0].error or "")
+        assert "fresh UIDs" in (result.failed[0].error or "")
+        # CRITICAL: no COPY/STORE issued against any UID; no EXPUNGE.
+        assert bridge.copies == []
+        assert bridge.added_flags == []
+        assert bridge.moves == []
+        assert bridge.expunges == 0
+
+    async def test_single_delete_absent_uid_mutates_nothing(self, bridge: FakeBridgeState) -> None:
+        bridge.folders.append(((), "Trash"))
+        bridge.absent_uids = {3}
+        manager = make_manager()
+        result = await manager.move_to_trash("INBOX", [3])
+        assert result.succeeded == []
+        assert [item.uid for item in result.failed] == [3]
+        assert "not present" in (result.failed[0].error or "")
+        assert bridge.copies == []
+        assert bridge.added_flags == []
+        assert bridge.expunges == 0
+
+    async def test_single_mark_absent_uid_mutates_nothing(self, bridge: FakeBridgeState) -> None:
+        bridge.absent_uids = {7}
+        manager = make_manager()
+        result = await manager.mark_messages("INBOX", [7], "read")
+        assert result.succeeded == []
+        assert [item.uid for item in result.failed] == [7]
+        assert "not present" in (result.failed[0].error or "")
+        assert bridge.added_flags == []
+        assert bridge.removed_flags == []
+        assert bridge.expunges == 0
+
+    async def test_batch_move_one_absent_uid_partial_success(self, bridge: FakeBridgeState) -> None:
+        # Present UIDs move; the absent UID is reported failed with UidStale guidance;
+        # no whole-batch abort and no EXPUNGE (Epic 2 partial-success model preserved).
+        bridge.absent_uids = {11}
+        manager = make_manager()
+        result = await manager.move_messages("INBOX", "receipts", [10, 11, 12])
+        assert result.succeeded == [10, 12]
+        assert [item.uid for item in result.failed] == [11]
+        assert "UIDVALIDITY changed" in (result.failed[0].error or "")
+        # Only the present UIDs were copied/flagged — never the stale one.
+        assert bridge.copies == [([10], "Folders/receipts"), ([12], "Folders/receipts")]
+        assert bridge.added_flags == [([10], [DELETED_FLAG]), ([12], [DELETED_FLAG])]
+        assert bridge.moves == []
+        assert bridge.expunges == 0
+
+    async def test_batch_mark_one_absent_uid_partial_success(self, bridge: FakeBridgeState) -> None:
+        bridge.absent_uids = {8}
+        manager = make_manager()
+        result = await manager.mark_messages("INBOX", [7, 8], "flagged")
+        assert result.succeeded == [7]
+        assert [item.uid for item in result.failed] == [8]
+        assert "not present" in (result.failed[0].error or "")
+        assert bridge.added_flags == [([7], [FLAGGED_FLAG])]
+        assert bridge.expunges == 0
 
 
 class TestSearchCriteria:

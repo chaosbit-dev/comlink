@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import imaplib
 import json
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -206,13 +207,14 @@ class TestPartialAndBoundary:
 
     async def test_empty_uids_rejected_for_every_write_tool(self, bridge: FakeBridgeState) -> None:
         manager = make_manager()
-        for call in (
+        calls: tuple[Callable[[], Awaitable[dict[str, Any]]], ...] = (
             lambda: move_messages_impl(
                 manager, uids=[], source_folder="INBOX", destination_folder="receipts"
             ),
             lambda: mark_messages_impl(manager, uids=[], folder="INBOX", mark="read"),
             lambda: delete_messages_impl(make_settings(), manager, uids=[], folder="INBOX"),
-        ):
+        )
+        for call in calls:
             with pytest.raises(ComlinkError, match="at least one UID"):
                 await call()
         assert bridge.copies == []
