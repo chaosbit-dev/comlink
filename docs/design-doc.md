@@ -47,7 +47,9 @@ An MCP server that gives Claude full mailbox capability against a Proton Mail ac
                               Web app / iOS app see all changes
 ```
 
-**Phase 2 (deferred, design only):** Comlink runs as a container on Gonk K3s with `transport="streamable-http"`, pointed at the already-running headless Bridge on Gonk. Exposed only on the tailnet (no Traefik public route). Same codebase, transport selected by env var.
+**Phase 2 (deferred, design only):** Comlink runs as a container on Gonk K3s with `transport="streamable-http"`, pointed at the already-running headless Bridge on Gonk. The target is a **remote MCP server reachable from the Claude mobile app / claude.ai**, which requires a **public HTTPS endpoint** (Traefik route + cert) fronted by **OAuth**, with the token scoped to Brandon's own identity. A tailnet is *not* reachable from the Claude mobile app, so the earlier "tailnet-only" model was wrong for this target and has been corrected here. Same codebase, transport selected by env var; the streamable-http transport and the OAuth resource-server token validation are themselves deferred implementation work (see Epic 5).
+
+**Phase 2 threat model.** Because the server is reachable by an authenticated *remote* session that reads attacker-controlled email content, the live threat is **email-borne prompt injection of Brandon's own authenticated session** into send/move/delete actions. OAuth proves *identity* but cannot stop *model-level* injection — a hostile email read inside a legitimately authenticated session is still hostile. What bounds the blast radius is structural, not the login: the **send gate** (env flag → allowlist → confirm → rate limit) and **Trash-only deletes** (never EXPUNGE). The OAuth layer must do real **audience-bound, scoped resource-server token validation** — not merely an edge login — and that property must be verified when the transport epic lands.
 
 ---
 
@@ -63,7 +65,7 @@ These are the gotchas that will burn you if the implementation ignores them:
 3. **Labels behave like Gmail labels.** "Moving" to a label is really applying it (message stays in its folder). `proton_move_messages` must reject label targets and direct the agent to `proton_label_messages` (v1.1) or explain the distinction in the error.
 4. **Self-signed TLS cert.** Bridge serves STARTTLS with its own certificate. Config supports: `verify` (default, requires the Bridge cert be trusted/pinned via `COMLINK_TLS_CERT_PATH`) or `no-verify` (acceptable for 127.0.0.1 only — refuse `no-verify` when host ≠ localhost).
 5. **UIDVALIDITY can change.** Never cache UIDs across sessions. Every tool call re-selects the mailbox; treat UIDs as valid only within the current selection.
-6. **Sent mail handling.** Sending via Bridge SMTP results in Proton saving the Sent copy server-side. Do **not** also APPEND to `Sent` — you'll create duplicates.
+6. **Sent mail handling.** Sending via Bridge SMTP results in Proton saving the Sent copy server-side. Do **not** also APPEND to `Sent` — you'll create duplicates. *(Inferred from Bridge behavior, not yet confirmed against this account — verify on a live MCP Inspector pass that exactly one Sent copy appears after a gated send, and reinstate a conditional APPEND only if it does not.)*
 7. **Bridge must be running.** Connection failures should produce an actionable error: "Proton Mail Bridge does not appear to be running on 127.0.0.1:1143. Start the Bridge app and retry."
 
 ---
@@ -186,7 +188,7 @@ Verifies IMAP + SMTP connectivity, reports Bridge reachability, account, folder 
 ## 7. Security Model
 
 1. **Send is opt-in at three layers:** env flag (tool not registered) → recipient allowlist → rate limit. Defaults: off, empty, 5/hr.
-2. **Email content is untrusted input.** Every message body returned to the model is prefixed with an untrusted-content marker. The server never interprets or acts on message content itself; mitigation against prompt injection ultimately lives with the client's tool-approval UX, but the marker + draft-first design means a hostile email can't silently trigger outbound mail: send requires the gate open *and* allowlist match *and* (in Claude Desktop) human tool approval.
+2. **Email content is untrusted input.** Every message body returned to the model is prefixed with an untrusted-content marker. The server never interprets or acts on message content itself; mitigation against prompt injection ultimately lives with the client's tool-approval UX, but the marker + draft-first design means a hostile email can't silently trigger outbound mail: send requires the gate open *and* allowlist match *and* (in Claude Desktop) human tool approval. Epic 4's untrusted-content marking and error redaction harden the Phase 2 remote threat model (see §2, "Phase 2 threat model") — but they are **advisory** (they bias the model), not an enforcement boundary; the structural send gate and Trash-only deletes are what actually bound the blast radius.
 3. **Destructive ops are soft.** Delete = move to Trash; Trash and Spam are protected from further deletion; no EXPUNGE anywhere in the codebase.
 4. **Credentials:** password via command (Keychain/Vaultwarden) preferred; never logged, never echoed in errors; redaction helper in `errors.py` scrubs the password from any exception text before it leaves the server.
 5. **Audit trail:** sends and deletes append to JSONL with enough detail to reconstruct what an agent did and when.
@@ -240,7 +242,13 @@ Fuzzy folder suggestions; UIDVALIDITY staleness handling; redaction audit; READM
 **Acceptance:** All evals pass; `mypy --strict` and Ruff clean; README sufficient for future-Brandon on a fresh machine.
 
 ### Epic 5 — Gonk deployment (Phase 2, design-only for now)
-Containerize (distroless-ish Python image); `streamable-http` transport; Deployment on Gonk K3s pointed at headless Bridge service; tailnet-only exposure (no public Traefik route); password from K8s Secret synced from Vaultwarden; revisit TLS pinning against the Gonk Bridge cert. **Out of scope until Epics 0–4 ship.**
+Containerize (distroless-ish Python image); `streamable-http` transport; Deployment on Gonk K3s pointed at headless Bridge service; password from K8s Secret synced from Vaultwarden; revisit TLS pinning against the Gonk Bridge cert.
+
+**Remote exposure model (corrected).** The target client is the Claude mobile app / claude.ai, which cannot reach a tailnet — so this is a **public HTTPS endpoint** via Traefik (real cert) fronted by **OAuth**, scoped to Brandon's own identity, *not* tailnet-only exposure. Two pieces of new implementation land here and are deferred until then:
+- The `streamable-http` transport itself.
+- **OAuth resource-server token validation** — and it must be real **audience-bound, scoped** token validation on every request, not just an edge login that proxies anything through once authenticated. Verify this property explicitly when the epic is built.
+
+See §2 ("Phase 2 threat model") for why OAuth identity alone is insufficient: the live risk is email-borne prompt injection of Brandon's own authenticated session, bounded by the structural send gate and Trash-only deletes rather than by the login. **Out of scope until Epics 0–4 ship.**
 
 ---
 
