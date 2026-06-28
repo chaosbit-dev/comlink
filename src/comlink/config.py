@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from comlink.errors import ConfigError, redact
@@ -36,6 +36,13 @@ class ComlinkSettings(BaseSettings):
 
     tls_mode: Literal["verify", "no-verify"] = "verify"
     tls_cert_path: Path | None = None
+    smtp_security: Literal["starttls", "ssl"] = Field(
+        default="starttls",
+        description=(
+            '"starttls" = connect plaintext then STARTTLS (Bridge default); '
+            '"ssl" = implicit TLS on connect (for Bridge configured with SSL).'
+        ),
+    )
 
     allow_send: bool = False
     send_allowlist: str = ""
