@@ -17,22 +17,54 @@ from comlink.config import ComlinkSettings
 from comlink.errors import AuthFailed, BridgeUnavailable, ComlinkError, redact
 
 
+def _build_client(settings: ComlinkSettings, timeout: int) -> aiosmtplib.SMTP:
+    """Construct the SMTP client for the configured TLS mode (§3.4).
+
+    ``ssl`` = implicit TLS negotiated on connect (for a Bridge SMTP endpoint
+    configured with SSL); ``starttls`` = connect plaintext then upgrade via
+    STARTTLS (the Bridge default). Both reuse ``build_ssl_context`` so the
+    no-verify / cert-pinning policy applies either way.
+    """
+    if settings.smtp_security == "ssl":
+        return aiosmtplib.SMTP(
+            hostname=settings.smtp_host,
+            port=settings.smtp_port,
+            timeout=timeout,
+            use_tls=True,
+            tls_context=settings.build_ssl_context(),
+        )
+    return aiosmtplib.SMTP(
+        hostname=settings.smtp_host,
+        port=settings.smtp_port,
+        timeout=timeout,
+        start_tls=False,
+        use_tls=False,
+    )
+
+
+async def _connect_and_login(
+    client: aiosmtplib.SMTP, settings: ComlinkSettings, password: str
+) -> None:
+    """Connect, upgrade to TLS if STARTTLS mode, and authenticate.
+
+    In ``ssl`` mode the TLS handshake happens inside ``connect()``; STARTTLS must
+    NOT be issued. In ``starttls`` mode the connection opens plaintext and is
+    upgraded here before login.
+    """
+    await client.connect()
+    if settings.smtp_security == "starttls":
+        await client.starttls(tls_context=settings.build_ssl_context())
+    await client.login(settings.username, password)
+
+
 async def verify_smtp_connectivity(settings: ComlinkSettings, password: str) -> None:
     """Connect, STARTTLS, and authenticate against the Bridge SMTP endpoint.
 
     Raises a taxonomy error on failure; returns ``None`` on success.
     """
-    client = aiosmtplib.SMTP(
-        hostname=settings.smtp_host,
-        port=settings.smtp_port,
-        timeout=15,
-        start_tls=False,
-        use_tls=False,
-    )
+    client = _build_client(settings, timeout=15)
     try:
-        await client.connect()
-        await client.starttls(tls_context=settings.build_ssl_context())
-        await client.login(settings.username, password)
+        await _connect_and_login(client, settings, password)
     except aiosmtplib.SMTPAuthenticationError as exc:
         raise AuthFailed.smtp() from exc
     except (aiosmtplib.SMTPConnectError, aiosmtplib.SMTPConnectTimeoutError, OSError) as exc:
@@ -63,17 +95,9 @@ async def send_message(
     """
     from_addr = str(message["From"])
     message_id = str(message["Message-ID"])
-    client = aiosmtplib.SMTP(
-        hostname=settings.smtp_host,
-        port=settings.smtp_port,
-        timeout=30,
-        start_tls=False,
-        use_tls=False,
-    )
+    client = _build_client(settings, timeout=30)
     try:
-        await client.connect()
-        await client.starttls(tls_context=settings.build_ssl_context())
-        await client.login(settings.username, password)
+        await _connect_and_login(client, settings, password)
         await client.send_message(message, sender=from_addr, recipients=envelope_recipients)
     except aiosmtplib.SMTPAuthenticationError as exc:
         raise AuthFailed.smtp() from exc

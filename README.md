@@ -91,7 +91,8 @@ logged. Mirrors `src/comlink/config.py`.
 | `COMLINK_IMAP_HOST` | `127.0.0.1` | Bridge IMAP host |
 | `COMLINK_IMAP_PORT` | `1143` | Bridge IMAP port (STARTTLS) |
 | `COMLINK_SMTP_HOST` | `127.0.0.1` | Bridge SMTP host |
-| `COMLINK_SMTP_PORT` | `1025` | Bridge SMTP port (STARTTLS) |
+| `COMLINK_SMTP_PORT` | `1025` | Bridge SMTP port. |
+| `COMLINK_SMTP_SECURITY` | `starttls` | `starttls` (connect plaintext, upgrade in-band — Bridge default) or `ssl` (implicit TLS on connect). Set to `ssl` if your Bridge's SMTP is configured for SSL/TLS. |
 | `COMLINK_USERNAME` | `""` | Bridge username (usually your Proton address) |
 | `COMLINK_PASSWORD` | _unset_ | Bridge app password (NOT the Proton account password). Prefer the command form below. |
 | `COMLINK_PASSWORD_COMMAND` | _unset_ | Shell command whose stdout is the app password, e.g. `security find-generic-password -s proton-bridge -w` (Keychain) or `bw get password proton-bridge` (Vaultwarden). **Wins over `COMLINK_PASSWORD` if both are set.** |

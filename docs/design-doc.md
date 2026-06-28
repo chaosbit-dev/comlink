@@ -122,6 +122,7 @@ All via env vars (Pydantic Settings, prefix `COMLINK_`). No secrets ever logged.
 | `COMLINK_PASSWORD_COMMAND` | — | Preferred over the above. Shell command whose stdout is the password, e.g. `security find-generic-password -s proton-bridge -w` (macOS Keychain) or `bw get password proton-bridge` (Vaultwarden). Wins if both set. |
 | `COMLINK_TLS_MODE` | `verify` | `verify` \| `no-verify` (localhost only) |
 | `COMLINK_TLS_CERT_PATH` | — | Pinned Bridge cert for `verify` mode |
+| `COMLINK_SMTP_SECURITY` | `starttls` | `starttls` (connect plaintext, upgrade in-band) \| `ssl` (implicit TLS on connect — for a Bridge SMTP endpoint configured with SSL) |
 | `COMLINK_ALLOW_SEND` | `false` | Master send gate. `proton_send_message` is not even registered when false — the tool is invisible, not just refusing. |
 | `COMLINK_SEND_ALLOWLIST` | — | Comma-separated addresses/domains (e.g. `kendra@…, *@chaosbit.dev`). Empty + send enabled = any recipient (warn loudly at startup). |
 | `COMLINK_SEND_MAX_PER_HOUR` | `5` | Sliding-window rate limit |

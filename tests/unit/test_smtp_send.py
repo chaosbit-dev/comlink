@@ -13,7 +13,7 @@ import aiosmtplib
 import pytest
 
 from comlink.bridge.parsing import build_message
-from comlink.bridge.smtp import send_message
+from comlink.bridge.smtp import send_message, verify_smtp_connectivity
 from comlink.errors import AuthFailed, BridgeUnavailable, ComlinkError
 
 from ..conftest import make_settings
@@ -122,3 +122,74 @@ class TestSendMessage:
             )
         assert "super-secret-pw" not in str(excinfo.value)
         assert "[REDACTED]" in str(excinfo.value)
+
+
+class TestSmtpTlsModes:
+    """COMLINK_SMTP_SECURITY selects STARTTLS (default) vs implicit SSL.
+
+    A Bridge SMTP endpoint configured for SSL negotiates TLS on connect and must
+    NOT receive a STARTTLS command; the STARTTLS default connects plaintext and
+    upgrades in-band. Both modes must keep the same error taxonomy + redaction.
+    """
+
+    async def test_default_mode_is_starttls(self, smtp_config: SMTPConfig) -> None:
+        settings = make_settings(username="brandon@chaosbit.dev")
+        assert settings.smtp_security == "starttls"
+        await send_message(settings, "pw", _msg(), envelope_recipients=["k@chaosbit.dev"])
+        client = smtp_config.instances[0]
+        assert "starttls" in client.calls
+        assert client.kwargs["use_tls"] is False
+        assert client.kwargs["start_tls"] is False
+
+    async def test_ssl_mode_skips_starttls_and_negotiates_on_connect(
+        self, smtp_config: SMTPConfig
+    ) -> None:
+        settings = make_settings(username="brandon@chaosbit.dev", smtp_security="ssl")
+        message = _msg()
+        returned = await send_message(
+            settings, "pw", message, envelope_recipients=["kendra@chaosbit.dev"]
+        )
+        assert returned == str(message["Message-ID"])
+        client = smtp_config.instances[0]
+        # Implicit TLS: handshake on connect, NO STARTTLS, login + send still happen.
+        assert client.kwargs["use_tls"] is True
+        assert client.kwargs["tls_context"] is not None
+        assert "starttls" not in client.calls
+        assert client.calls[:3] == ["connect", "login", "send_message"]
+        assert client.sent == [("brandon@chaosbit.dev", ["kendra@chaosbit.dev"])]
+
+    async def test_ssl_mode_auth_error_still_maps_to_auth_failed(
+        self, smtp_config: SMTPConfig
+    ) -> None:
+        smtp_config.raise_on = "login"
+        smtp_config.exc = aiosmtplib.SMTPAuthenticationError(535, "bad")
+        settings = make_settings(username="brandon@chaosbit.dev", smtp_security="ssl")
+        with pytest.raises(AuthFailed, match="SMTP login rejected"):
+            await send_message(settings, "pw", _msg(), envelope_recipients=["k@chaosbit.dev"])
+
+    async def test_ssl_mode_connect_timeout_maps_to_bridge_unavailable(
+        self, smtp_config: SMTPConfig
+    ) -> None:
+        smtp_config.raise_on = "connect"
+        smtp_config.exc = aiosmtplib.SMTPConnectTimeoutError("slow")
+        settings = make_settings(username="brandon@chaosbit.dev", smtp_security="ssl")
+        with pytest.raises(BridgeUnavailable, match="SMTP"):
+            await send_message(settings, "pw", _msg(), envelope_recipients=["k@chaosbit.dev"])
+
+    async def test_verify_connectivity_ssl_mode_skips_starttls(
+        self, smtp_config: SMTPConfig
+    ) -> None:
+        settings = make_settings(username="brandon@chaosbit.dev", smtp_security="ssl")
+        await verify_smtp_connectivity(settings, "pw")
+        client = smtp_config.instances[0]
+        assert client.kwargs["use_tls"] is True
+        assert "starttls" not in client.calls
+        assert client.calls[:2] == ["connect", "login"]
+
+    async def test_verify_connectivity_starttls_mode_upgrades(
+        self, smtp_config: SMTPConfig
+    ) -> None:
+        settings = make_settings(username="brandon@chaosbit.dev")
+        await verify_smtp_connectivity(settings, "pw")
+        client = smtp_config.instances[0]
+        assert client.calls[:3] == ["connect", "starttls", "login"]
