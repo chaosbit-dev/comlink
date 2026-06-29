@@ -70,8 +70,11 @@ sudo nerdctl --namespace k8s.io images | grep comlink
 ## 2. Create the namespace
 
 ```bash
-kubectl apply -f deploy/namespace.yaml
+kubectl apply -f deploy/00-namespace.yaml
 ```
+
+(The file is named `00-namespace.yaml` so that `kubectl apply -f deploy/`
+applies it first — alphabetical order, before the namespaced resources.)
 
 ---
 
@@ -128,9 +131,10 @@ cert to be present, or the pod refuses to start (config validation in
 
 The Secret and ConfigMap were already created imperatively (steps 3–4). The
 example Secret now lives under `deploy/examples/`, and `kubectl apply -f deploy/`
-is **non-recursive** — it applies only the top-level `namespace.yaml`,
-`deployment.yaml`, and `service.yaml` (the `.sh`/`.md` and `examples/` are
-ignored). So this is safe and won't touch your real Secret:
+is **non-recursive** — it applies only the top-level `00-namespace.yaml`,
+`deployment.yaml`, and `service.yaml` in alphabetical order (namespace first, so
+no ordering error; the `.sh`/`.md` and `examples/` are ignored). So this is safe
+and won't touch your real Secret:
 
 ```bash
 kubectl apply -f deploy/
@@ -275,6 +279,6 @@ bump the image tag if code changed, and re-cut.
 kubectl delete -f deploy/deployment.yaml -f deploy/service.yaml
 kubectl -n comlink delete configmap bridge-cert
 kubectl -n comlink delete secret comlink-bridge
-kubectl delete -f deploy/namespace.yaml
+kubectl delete -f deploy/00-namespace.yaml
 sudo k3s ctr --namespace k8s.io images rm comlink:0.1.0   # or nerdctl rmi
 ```
