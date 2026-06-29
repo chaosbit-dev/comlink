@@ -165,4 +165,8 @@ class HealthReport(ComlinkModel):
     smtp: EndpointStatus
     account: str
     folder_count: int | None = None
+    # When true, only the five read tools are registered; all write/organize/
+    # compose tools (including the send gate) are invisible to the client (§7.1
+    # registration-time gating, mirrored for read-only mode).
+    read_only: bool = False
     send_gate: SendGateStatus

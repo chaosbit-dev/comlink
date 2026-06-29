@@ -98,11 +98,16 @@ logged. Mirrors `src/comlink/config.py`.
 | `COMLINK_PASSWORD_COMMAND` | _unset_ | Shell command whose stdout is the app password, e.g. `security find-generic-password -s proton-bridge -w` (Keychain) or `bw get password proton-bridge` (Vaultwarden). **Wins over `COMLINK_PASSWORD` if both are set.** |
 | `COMLINK_TLS_MODE` | `verify` | `verify` or `no-verify`. `no-verify` is refused for non-localhost hosts. |
 | `COMLINK_TLS_CERT_PATH` | _unset_ | Pinned Bridge certificate for `verify` mode. |
+| `COMLINK_READ_ONLY` | `false` | When `true`, only the five read tools are registered (`proton_health_check`, `proton_list_folders`, `proton_list_messages`, `proton_search_messages`, `proton_get_message`). Every write/organize/compose tool — including `proton_send_message` — is **not registered** and invisible to the client. Overrides `COMLINK_ALLOW_SEND`. |
 | `COMLINK_ALLOW_SEND` | `false` | Master send gate. When `false`, `proton_send_message` is **not registered** — the tool is invisible to the client, not just refusing. |
 | `COMLINK_SEND_ALLOWLIST` | `""` | Comma-separated recipients. Exact address (`kendra@chaosbit.dev`) or `*@domain` wildcard (`*@chaosbit.dev`). **Empty + send enabled = any recipient** (logged loudly at startup). |
 | `COMLINK_SEND_MAX_PER_HOUR` | `5` | Sliding-window send rate limit. |
 | `COMLINK_AUDIT_LOG` | `~/.comlink/audit.jsonl` | Append-only JSONL of every send and delete. |
-| `COMLINK_TRANSPORT` | `stdio` | `stdio` (Phase 1) or `streamable-http` (Phase 2, deferred). |
+| `COMLINK_TRANSPORT` | `stdio` | `stdio` (Phase 1) or `streamable-http` (Phase 2, remote on Gonk behind Cloudflare Access). |
+| `COMLINK_HTTP_HOST` | `127.0.0.1` | Bind address for `streamable-http`. Use `0.0.0.0` in a container. Ignored for `stdio`. |
+| `COMLINK_HTTP_PORT` | `8000` | Bind port for `streamable-http`. Ignored for `stdio`. |
+| `COMLINK_HTTP_PATH` | `/mcp` | Mount path for the `streamable-http` endpoint. Ignored for `stdio`. |
+| `COMLINK_HTTP_ALLOWED_HOSTS` | `""` | Comma-separated `Host` allowlist for DNS-rebinding protection. When set, protection is **on** and only these hosts (and `https://<host>` origins) are accepted — set it to your public hostname (e.g. `comlink.chaosbit.dev`). When empty, protection is **disabled** with a logged warning: acceptable behind Cloudflare Access, never for bare-internet exposure. |
 
 Set at least `COMLINK_USERNAME` and `COMLINK_PASSWORD_COMMAND`. Everything else has working
 defaults for a local Bridge.

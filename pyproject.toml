@@ -44,6 +44,9 @@ asyncio_mode = "auto"
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+# experiments/ holds throwaway debugging tooling (auth probes, CF API scripts),
+# not shipped package code — excluded from the lint gate.
+extend-exclude = ["experiments"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF"]
