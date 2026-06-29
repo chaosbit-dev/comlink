@@ -9,6 +9,7 @@ and must not pick up any HTTP settings. No real server is started here.
 from __future__ import annotations
 
 import pytest
+from mcp.server.fastmcp import FastMCP
 
 from comlink import server as server_module
 from comlink.config import ComlinkSettings
@@ -71,21 +72,48 @@ class TestStreamableHttpBuild:
 
 
 class TestMainWiresTransport:
-    @pytest.mark.parametrize("transport", ["stdio", "streamable-http"])
-    def test_main_runs_with_configured_transport(
-        self, transport: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_stdio_uses_fastmcp_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured: dict[str, object] = {}
 
         def fake_load_settings() -> ComlinkSettings:
-            return make_settings(transport=transport, http_allowed_hosts="comlink.chaosbit.dev")
+            return make_settings(transport="stdio")
 
-        def fake_run(self: object, transport: str) -> None:
-            captured["transport"] = transport
+        def fake_run(self: object) -> None:
+            captured["ran"] = True
+
+        def fake_run_http(server: object, settings: object) -> None:
+            captured["http"] = True
 
         monkeypatch.setattr(server_module, "load_settings", fake_load_settings)
         monkeypatch.setattr("mcp.server.fastmcp.FastMCP.run", fake_run)
+        monkeypatch.setattr(server_module, "_run_http", fake_run_http)
 
         main()
 
-        assert captured["transport"] == transport
+        assert captured == {"ran": True}
+
+    def test_streamable_http_uses_run_http(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_load_settings() -> ComlinkSettings:
+            return make_settings(
+                transport="streamable-http", http_allowed_hosts="comlink.chaosbit.dev"
+            )
+
+        def fake_run(self: object) -> None:
+            captured["ran"] = True
+
+        def fake_run_http(server: FastMCP, settings: ComlinkSettings) -> None:
+            captured["http_server"] = server
+            captured["http_transport"] = settings.transport
+
+        monkeypatch.setattr(server_module, "load_settings", fake_load_settings)
+        monkeypatch.setattr("mcp.server.fastmcp.FastMCP.run", fake_run)
+        monkeypatch.setattr(server_module, "_run_http", fake_run_http)
+
+        main()
+
+        # stdio run path must NOT be taken; _run_http gets the configured server.
+        assert "ran" not in captured
+        assert captured["http_transport"] == "streamable-http"
+        assert isinstance(captured["http_server"], FastMCP)

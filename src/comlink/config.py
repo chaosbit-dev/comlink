@@ -8,10 +8,10 @@ from __future__ import annotations
 import ssl
 import subprocess
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from comlink.errors import ConfigError, redact
 
@@ -67,6 +67,28 @@ class ComlinkSettings(BaseSettings):
     # check — acceptable behind Cloudflare Access, never for bare-internet.
     http_allowed_hosts: str = ""
 
+    # --- Cloudflare Access JWT validation (streamable-http only, Epic 5) ------
+    # Defense-in-depth in front of the MCP app: re-validate the Access JWT that
+    # Cloudflare injects, in-process, so a direct in-cluster hit on the ClusterIP
+    # cannot bypass the edge auth. See comlink.access.
+    require_access_jwt: bool = False
+    access_aud: str = ""
+    access_team_domain: str = ""
+    # Allowlist of `email` claim values. Comma-separated in env
+    # (COMLINK_ACCESS_ALLOWED_EMAILS). Empty list disables the email check.
+    # NoDecode keeps pydantic-settings from JSON-decoding the env string so the
+    # field_validator below can split it on commas (matches HA-MCP's approach for
+    # this list field; comlink's other lists are str + a parse method).
+    access_allowed_emails: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    @field_validator("access_allowed_emails", mode="before")
+    @classmethod
+    def _split_emails(cls, value: object) -> object:
+        """Accept comma-separated env strings as well as native lists."""
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
     @model_validator(mode="after")
     def _refuse_no_verify_off_localhost(self) -> ComlinkSettings:
         """TLS ``no-verify`` is acceptable for localhost only (design doc §3.4, §7.6)."""
@@ -96,6 +118,43 @@ class ComlinkSettings(BaseSettings):
                 "the hostname check. Set COMLINK_TLS_CERT_PATH to the mounted Bridge cert."
             )
         return self
+
+    @model_validator(mode="after")
+    def _require_access_config_when_gated(self) -> ComlinkSettings:
+        """Fail fast on a misconfigured Access gate (Epic 5).
+
+        When ``COMLINK_REQUIRE_ACCESS_JWT`` is true, both the audience tag and the
+        team domain MUST be set — otherwise the validator would have no ``aud`` to
+        check and no JWKS/issuer to verify against, silently degrading the gate.
+        Refuse to start rather than serve a hollow gate.
+        """
+        if self.require_access_jwt:
+            missing = [
+                name
+                for name, value in (
+                    ("COMLINK_ACCESS_AUD", self.access_aud),
+                    ("COMLINK_ACCESS_TEAM_DOMAIN", self.access_team_domain),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "COMLINK_REQUIRE_ACCESS_JWT=true requires "
+                    f"{' and '.join(missing)} to be set. The Cloudflare Access gate "
+                    "cannot validate the Cf-Access-Jwt-Assertion without the application "
+                    "AUD tag and the team domain. Set them, or disable the gate."
+                )
+        return self
+
+    @property
+    def access_issuer(self) -> str:
+        """Expected JWT ``iss`` claim for the configured team."""
+        return f"https://{self.access_team_domain}"
+
+    @property
+    def access_jwks_url(self) -> str:
+        """Cloudflare Access signing-key (JWKS) endpoint for the configured team."""
+        return f"https://{self.access_team_domain}/cdn-cgi/access/certs"
 
     def resolve_password(self) -> str:
         """Return the Bridge app password.

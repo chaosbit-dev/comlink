@@ -83,6 +83,23 @@ spec:
             # or every request is rejected. See deploy/README.md cutover step.
             - name: COMLINK_HTTP_ALLOWED_HOSTS
               value: "mcp-comlink.chaosbit.dev"
+            # --- Cloudflare Access JWT gate (defense-in-depth) ----------------
+            # In-process re-validation of the Cf-Access-Jwt-Assertion header so a
+            # direct in-cluster hit on the ClusterIP cannot bypass edge auth. The
+            # AUD tag and team domain are identifiers, not secrets.
+            - name: COMLINK_ACCESS_AUD
+              value: "35ba36c80296906ab5be03919ca0ee66e058fac2d23a9bd861edb34e77615300"
+            - name: COMLINK_ACCESS_TEAM_DOMAIN
+              value: "chaosbit.cloudflareaccess.com"
+            - name: COMLINK_ACCESS_ALLOWED_EMAILS
+              value: "brandon@chaosbit.dev,brandon.luttrell@att.net"
+            # STAYS false until we confirm OUT-OF-BAND that Cloudflare injects the
+            # Cf-Access-Jwt-Assertion header on the Claude-app Managed-OAuth path.
+            # Flipping to true before that is verified would 401-block the working
+            # read path. The middleware logs a WARNING on every header-less request,
+            # which is the signal to watch before flipping this.
+            - name: COMLINK_REQUIRE_ACCESS_JWT
+              value: "false"
             # --- Bridge app password from the Secret --------------------------
             - name: COMLINK_PASSWORD
               valueFrom:

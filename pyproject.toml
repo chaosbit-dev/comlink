@@ -12,6 +12,12 @@ dependencies = [
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
     "anyio>=4.4.0",
+    # Cloudflare Access JWT gate (Epic 5): RS256 verification + JWKS fetch, and the
+    # uvicorn server that hosts the wrapped streamable-http app. httpx is pulled in
+    # transitively by mcp but is a direct import in comlink.access, so pin it here.
+    "pyjwt[crypto]>=2.10.0",
+    "httpx>=0.28.0",
+    "uvicorn>=0.30.0",
 ]
 
 [project.scripts]

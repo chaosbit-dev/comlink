@@ -108,6 +108,10 @@ logged. Mirrors `src/comlink/config.py`.
 | `COMLINK_HTTP_PORT` | `8000` | Bind port for `streamable-http`. Ignored for `stdio`. |
 | `COMLINK_HTTP_PATH` | `/mcp` | Mount path for the `streamable-http` endpoint. Ignored for `stdio`. |
 | `COMLINK_HTTP_ALLOWED_HOSTS` | `""` | Comma-separated `Host` allowlist for DNS-rebinding protection. When set, protection is **on** and only these hosts (and `https://<host>` origins) are accepted — set it to your public hostname (e.g. `comlink.chaosbit.dev`). When empty, protection is **disabled** with a logged warning: acceptable behind Cloudflare Access, never for bare-internet exposure. |
+| `COMLINK_REQUIRE_ACCESS_JWT` | `false` | Defense-in-depth gate for `streamable-http`. When `true`, every HTTP request must carry a valid `Cf-Access-Jwt-Assertion` header (RS256-verified against the team JWKS, plus `aud`/`iss`/`exp`/`iat` and the optional email allowlist) or it is rejected with 401 before reaching the MCP app — so a direct in-cluster hit on the ClusterIP can't bypass Cloudflare Access. Requires `COMLINK_ACCESS_AUD` and `COMLINK_ACCESS_TEAM_DOMAIN` (startup fails fast otherwise). Ignored for `stdio`. |
+| `COMLINK_ACCESS_AUD` | `""` | Cloudflare Access application **AUD** tag (an identifier, not a secret). Required when the gate is on. |
+| `COMLINK_ACCESS_TEAM_DOMAIN` | `""` | Cloudflare Access team domain, e.g. `chaosbit.cloudflareaccess.com`. The issuer (`https://<team>`) and JWKS URL (`https://<team>/cdn-cgi/access/certs`) are derived from it. Required when the gate is on. |
+| `COMLINK_ACCESS_ALLOWED_EMAILS` | `""` | Comma-separated allowlist of `email` claim values (e.g. `brandon@chaosbit.dev,brandon.luttrell@att.net`). Empty disables the per-email check (signature/`aud`/`iss`/time are still enforced). |
 
 Set at least `COMLINK_USERNAME` and `COMLINK_PASSWORD_COMMAND`. Everything else has working
 defaults for a local Bridge.
