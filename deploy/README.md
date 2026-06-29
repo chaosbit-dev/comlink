@@ -120,10 +120,11 @@ cert to be present, or the pod refuses to start (config validation in
 
 > **Refreshing the cert later.** Bridge regenerates this self-signed cert if you
 > ever re-auth or reinstall it — the pin will then mismatch and IMAP TLS fails.
-> When that happens, run **`bash deploy/refresh-bridge-cert.sh`**: it re-extracts
-> the cert Bridge currently presents, validates it, updates this ConfigMap, and
-> rolls the Deployment to pick it up — one command, and it won't clobber a working
-> pin with a bad extraction. (It also works here for the initial create.)
+> When that happens, run the **`refresh-bridge-cert.sh`** helper (lives in the
+> **`gonk-infra`** repo alongside the other Bridge/cluster ops scripts): it
+> re-extracts the cert Bridge currently presents, validates it, updates this
+> ConfigMap, and rolls the Deployment — one command, and it won't clobber a
+> working pin with a bad extraction.
 
 ---
 
@@ -184,41 +185,21 @@ connected, not by an HTTP probe.
 
 ## 7. Repoint the cloudflared tunnel to the Service
 
-Update the cloudflared ingress for `mcp-comlink.chaosbit.dev` from the bare
-host (`http://localhost:8000` / `host:8000`) to the in-cluster Service.
-
-If cloudflared runs **outside** the cluster on the Gonk host, the Service isn't
-directly reachable by ClusterIP — point it at the kube DNS name only if
-cloudflared runs in-cluster. Two cases:
-
-- **cloudflared runs in-cluster (a pod):** set the ingress service to
-  `http://comlink.comlink.svc.cluster.local:8000`.
-- **cloudflared runs on the host (systemd/binary):** keep a localhost target but
-  move it onto the Service via a stable port-forward / nodePort, OR move
-  cloudflared into the cluster. Simplest interim: a host-level
-  `kubectl -n comlink port-forward --address 127.0.0.1 svc/comlink 8000:8000`
-  unit and leave the ingress at `http://localhost:8000`. (This trades one
-  port-forward for another but now targets the durable pod, not the bare
-  process.)
-
-**Critical:** the tunnel MUST preserve the original Host header
-`mcp-comlink.chaosbit.dev`. Comlink's `COMLINK_HTTP_ALLOWED_HOSTS` rejects any
-other Host. In a cloudflared `config.yaml` ingress, do **not** set
-`httpHostHeader` to anything else, and do not override it to the origin's
-hostname. If the phone starts getting host-rejection errors after cutover, this
-is the cause.
-
-Example cloudflared ingress snippet (in-cluster service target):
+The tunnel runs **in-cluster** and its config lives in the **`gonk-infra`** repo
+(`cloudflared/`). Make sure its ingress routes `mcp-comlink.chaosbit.dev` to the
+Comlink Service:
 
 ```yaml
 ingress:
   - hostname: mcp-comlink.chaosbit.dev
     service: http://comlink.comlink.svc.cluster.local:8000
-    # Do NOT add httpHostHeader here — let the original Host pass through.
+    # Do NOT set httpHostHeader — the original Host must pass through.
   - service: http_status:404
 ```
 
-Restart/reload cloudflared after editing.
+**Critical:** the tunnel MUST preserve the original Host header
+`mcp-comlink.chaosbit.dev`, or Comlink's `COMLINK_HTTP_ALLOWED_HOSTS` rejects the
+request. Apply the change in `gonk-infra` and roll the cloudflared Deployment.
 
 ---
 
