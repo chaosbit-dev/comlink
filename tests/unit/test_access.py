@@ -453,6 +453,69 @@ class TestMiddleware:
         assert resp.status_code == 401
         assert called["n"] == 0  # wrapped app never reached
 
+    def test_valid_request_sets_principal_contextvar(
+        self,
+        settings: ComlinkSettings,
+        keypair: tuple[rsa.RSAPrivateKey, jwt.PyJWK],
+    ) -> None:
+        # M1: after a JWT validates, the middleware binds the principal (email) so the
+        # downstream audit builder can attribute the action to a concrete identity.
+        from comlink.audit_context import current_principal
+
+        private_key, jwk = keypair
+        seen: dict[str, str | None] = {}
+
+        async def endpoint(request: Request) -> PlainTextResponse:
+            _ = request
+            seen["principal"] = current_principal()
+            return PlainTextResponse("ok")
+
+        inner = Starlette(routes=[Route("/mcp", endpoint, methods=["GET"])])
+        middleware = CloudflareAccessMiddleware(inner, _validator_with_key(settings, "kid-1", jwk))
+        client = TestClient(middleware)
+        resp = client.get("/mcp", headers={"Cf-Access-Jwt-Assertion": _sign(private_key, "kid-1")})
+        assert resp.status_code == 200
+        assert seen["principal"] == ALLOWED_EMAIL
+        # The binding is reset on the way out — it never leaks past the request scope.
+        assert current_principal() is None
+
+    def test_principal_falls_back_to_sub_when_no_email(
+        self,
+        keypair: tuple[rsa.RSAPrivateKey, jwt.PyJWK],
+    ) -> None:
+        # When the email claim is absent (and the allowlist is empty), the Access
+        # subject is the principal — still a non-secret identifier.
+        from comlink.audit_context import current_principal
+
+        no_email_settings = make_settings(
+            access_aud=AUD,
+            access_team_domain=TEAM_DOMAIN,
+            access_allowed_emails=[],
+        )
+        private_key, jwk = keypair
+        now = int(time.time())
+        token = jwt.encode(
+            {"aud": AUD, "iss": ISSUER, "iat": now, "exp": now + 300, "sub": "user-123"},
+            private_key,
+            algorithm="RS256",
+            headers={"kid": "kid-1"},
+        )
+        seen: dict[str, str | None] = {}
+
+        async def endpoint(request: Request) -> PlainTextResponse:
+            _ = request
+            seen["principal"] = current_principal()
+            return PlainTextResponse("ok")
+
+        inner = Starlette(routes=[Route("/mcp", endpoint, methods=["GET"])])
+        middleware = CloudflareAccessMiddleware(
+            inner, _validator_with_key(no_email_settings, "kid-1", jwk)
+        )
+        client = TestClient(middleware)
+        resp = client.get("/mcp", headers={"Cf-Access-Jwt-Assertion": token})
+        assert resp.status_code == 200
+        assert seen["principal"] == "user-123"
+
     def test_non_http_scope_passes_through(
         self,
         settings: ComlinkSettings,

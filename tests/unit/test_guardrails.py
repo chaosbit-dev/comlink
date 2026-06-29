@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from comlink.audit_context import reset_principal, set_principal
 from comlink.errors import SendBlocked
 from comlink.guardrails import (
     RateLimiter,
@@ -39,6 +40,27 @@ class TestDeleteAuditEntry:
         entry = delete_audit_entry("INBOX", [1], [])
         flat = json.dumps(entry)
         assert "password" not in flat.lower()
+
+    def test_default_transport_is_stdio_and_principal_none(self) -> None:
+        # No request context => local stdio attribution, no principal.
+        entry = delete_audit_entry("INBOX", [1], [])
+        assert entry["transport"] == "stdio"
+        assert entry["principal"] is None
+
+    def test_transport_override_is_carried(self) -> None:
+        entry = delete_audit_entry("INBOX", [1], [], transport="streamable-http")
+        assert entry["transport"] == "streamable-http"
+
+    def test_principal_read_from_contextvar(self) -> None:
+        # M1: a delete driven by an authenticated remote request is attributed to it.
+        token = set_principal("brandon@chaosbit.dev")
+        try:
+            entry = delete_audit_entry("INBOX", [1], [], transport="streamable-http")
+        finally:
+            reset_principal(token)
+        assert entry["principal"] == "brandon@chaosbit.dev"
+        # The binding does not leak past the reset.
+        assert delete_audit_entry("INBOX", [1], [])["principal"] is None
 
 
 class TestAppendAudit:
@@ -165,6 +187,25 @@ class TestSendAuditEntry:
 
     def test_no_body_or_secrets(self) -> None:
         entry = send_audit_entry(["a@b.com"], "Subj", "<id@b.com>")
+        flat = json.dumps(entry).lower()
+        assert "body" not in flat
+        assert "password" not in flat
+
+    def test_default_transport_is_stdio_and_principal_none(self) -> None:
+        entry = send_audit_entry(["a@b.com"], "Subj", "<id@b.com>")
+        assert entry["transport"] == "stdio"
+        assert entry["principal"] is None
+
+    def test_principal_read_from_contextvar(self) -> None:
+        # M1: a send driven by an authenticated remote request carries that identity.
+        token = set_principal("brandon@chaosbit.dev")
+        try:
+            entry = send_audit_entry(["a@b.com"], "Subj", "<id@b.com>", transport="streamable-http")
+        finally:
+            reset_principal(token)
+        assert entry["principal"] == "brandon@chaosbit.dev"
+        assert entry["transport"] == "streamable-http"
+        # Principal is a non-secret identifier; the no-body / no-password guarantee holds.
         flat = json.dumps(entry).lower()
         assert "body" not in flat
         assert "password" not in flat

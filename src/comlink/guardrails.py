@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from comlink.audit_context import current_principal
 from comlink.config import ComlinkSettings
 from comlink.errors import SendBlocked
 
@@ -27,17 +28,37 @@ logger = logging.getLogger("comlink.guardrails")
 
 _SECONDS_PER_HOUR = 3600.0
 
+# Default requesting-context transport tag (§6) when no real transport is threaded in
+# — i.e. the local stdio case. Call sites in server.py pass ``settings.transport``
+# explicitly so the remote deployment records ``"streamable-http"`` instead. Never
+# carries a secret or the body.
+DEFAULT_TRANSPORT = "stdio"
+
 
 def audit_timestamp() -> str:
     """ISO 8601 UTC timestamp for audit entries."""
     return datetime.now(UTC).isoformat()
 
 
-def delete_audit_entry(folder: str, succeeded: list[int], failed: list[int]) -> dict[str, Any]:
-    """Build the delete audit entry. No secrets ever go in audit entries (§7.4)."""
+def delete_audit_entry(
+    folder: str,
+    succeeded: list[int],
+    failed: list[int],
+    transport: str = DEFAULT_TRANSPORT,
+) -> dict[str, Any]:
+    """Build the delete audit entry. No secrets ever go in audit entries (§7.4).
+
+    ``transport`` and ``principal`` are the design-§6 "requesting context": the
+    channel the delete arrived on and the authenticated identity that drove it (read
+    from :func:`comlink.audit_context.current_principal`). Both are non-secret tags;
+    ``principal`` is ``None`` under the stdio/local transport. A delete needs the same
+    attribution as a send — an injected destructive action must be traceable.
+    """
     return {
         "ts": audit_timestamp(),
         "action": "delete",
+        "transport": transport,
+        "principal": current_principal(),
         "folder": folder,
         "uids": list(succeeded) + list(failed),
         "succeeded": list(succeeded),
@@ -45,25 +66,23 @@ def delete_audit_entry(folder: str, succeeded: list[int], failed: list[int]) -> 
     }
 
 
-# Requesting-context tag for the send audit (§6). Static "stdio" for the Phase 1
-# local transport; forward-compatible for the Phase 2 remote transport, where this
-# becomes the authenticated OAuth subject. Never carries a secret or the body.
-SEND_TRANSPORT = "stdio"
-
-
 def send_audit_entry(
-    recipients: list[str], subject: str, message_id: str, transport: str = SEND_TRANSPORT
+    recipients: list[str], subject: str, message_id: str, transport: str = DEFAULT_TRANSPORT
 ) -> dict[str, Any]:
     """Build the send audit entry. No body, no password, no secrets (§7.4).
 
-    ``transport`` is the design-§6 "requesting context": the channel the send came
-    in on. It is a non-secret tag (default ``"stdio"``) — under the Phase 2 remote
-    transport it will carry the OAuth subject instead.
+    ``transport`` and ``principal`` are the design-§6 "requesting context".
+    ``transport`` is the channel the send arrived on (default ``"stdio"``; call sites
+    pass the real ``settings.transport``). ``principal`` is the authenticated identity
+    that drove the send, read from :func:`comlink.audit_context.current_principal`
+    (the Access email/subject under streamable-http; ``None`` under stdio/local). The
+    principal is a non-secret identifier — safe to log, unlike the body or password.
     """
     return {
         "ts": audit_timestamp(),
         "action": "send",
         "transport": transport,
+        "principal": current_principal(),
         "recipients": list(recipients),
         "subject": subject,
         "message_id": message_id,
