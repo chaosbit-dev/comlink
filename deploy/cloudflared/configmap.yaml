@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: cloudflared
+data:
+  config.yml: |
+    # Gonk tunnel (dfb3fb6c-3782-467e-be46-057a91937bd9) — in-cluster.
+    # Migrated from /etc/cloudflared/config.yml on the host. Targets converted
+    # from hardcoded ClusterIPs to stable Service DNS names (survive a Service
+    # recreation; the old IPs did not).
+    tunnel: dfb3fb6c-3782-467e-be46-057a91937bd9
+    credentials-file: /etc/cloudflared/credentials.json
+    # Liveness/metrics endpoint (probed by the Deployment):
+    metrics: 0.0.0.0:2000
+    no-autoupdate: true
+    ingress:
+      - hostname: remote.chaosbit.dev
+        service: http://homepage.pulse.svc.cluster.local:3000
+      - hostname: mcp-ha.chaosbit.dev
+        service: http://homeassistant-mcp.automation.svc.cluster.local:8100
+      - hostname: mcp-comlink.chaosbit.dev
+        service: http://comlink.comlink.svc.cluster.local:8000
+      - service: http_status:404
