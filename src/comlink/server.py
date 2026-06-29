@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from comlink.bridge import smtp
@@ -133,6 +134,7 @@ async def health_check_impl(
         smtp=smtp_status,
         account=settings.username or "(COMLINK_USERNAME not set)",
         folder_count=folder_count,
+        read_only=settings.read_only,
         send_gate=SendGateStatus(
             enabled=settings.allow_send,
             allowlist_size=len(settings.parsed_allowlist()),
@@ -555,8 +557,43 @@ async def send_message_impl(
 # ---------------------------------------------------------------------------
 
 
+def _build_transport_security(settings: ComlinkSettings) -> TransportSecuritySettings:
+    """DNS-rebinding protection for the streamable-http transport (design doc §2).
+
+    Mirrors experiments/auth_probe/auth_probe.py: when COMLINK_HTTP_ALLOWED_HOSTS is
+    set, protection is ON and only those Host headers (and https://<host> origins) are
+    accepted. When empty, protection is DISABLED with a loud warning — acceptable
+    behind Cloudflare Access, never for bare-internet exposure.
+    """
+    allowed_hosts = settings.parsed_http_allowed_hosts()
+    if allowed_hosts:
+        logger.info("DNS-rebinding protection ON; allowed_hosts=%s", allowed_hosts)
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=[f"https://{host}" for host in allowed_hosts],
+        )
+    logger.warning(
+        "DNS-rebinding protection DISABLED (COMLINK_HTTP_ALLOWED_HOSTS unset) — "
+        "acceptable behind Cloudflare Access, never for bare-internet exposure. "
+        "Set COMLINK_HTTP_ALLOWED_HOSTS to your public hostname (e.g. comlink.chaosbit.dev)."
+    )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
 def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
     settings = settings if settings is not None else load_settings()
+    # The stdio transport (default) takes no HTTP settings — keep its construction
+    # unchanged. Only the streamable-http transport (Phase 2, design doc §2/§5) gets
+    # the bind host/port, mount path, and DNS-rebinding transport security.
+    http_kwargs: dict[str, Any] = {}
+    if settings.transport == "streamable-http":
+        http_kwargs = {
+            "host": settings.http_host,
+            "port": settings.http_port,
+            "streamable_http_path": settings.http_path,
+            "transport_security": _build_transport_security(settings),
+        }
     mcp = FastMCP(
         SERVER_NAME,
         instructions=(
@@ -571,6 +608,7 @@ def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
             "expunges, so deleting from Trash or Spam is refused (empty those in a "
             "Proton client)."
         ),
+        **http_kwargs,
     )
     imap = ImapConnectionManager(settings)
     # One process-lifetime rate limiter shared by the send tool and the health
@@ -578,7 +616,8 @@ def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
     rate_limiter = RateLimiter()
 
     # Startup warning: send enabled with no allowlist = any-recipient mode (§5, §7.1).
-    if settings.allow_send and not settings.parsed_allowlist():
+    # Suppressed under read_only, where the send tool is never registered regardless.
+    if settings.allow_send and not settings.parsed_allowlist() and not settings.read_only:
         logger.warning(
             "COMLINK_ALLOW_SEND is true with an EMPTY COMLINK_SEND_ALLOWLIST: "
             "proton_send_message can send to ANY recipient. Set COMLINK_SEND_ALLOWLIST "
@@ -687,109 +726,75 @@ def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
             )
         )
 
-    @mcp.tool()
-    async def proton_move_messages(
-        uids: list[int],
-        source_folder: str,
-        destination_folder: str,
-    ) -> str:
-        """Move messages from one folder to another (max 50 UIDs per call).
+    # Read-only mode (§7.1 registration-time gating, mirrored): when
+    # COMLINK_READ_ONLY=true, NONE of the write/organize/compose tools are
+    # registered, so the entire mutating surface is invisible to the client —
+    # not registered-then-refusing. Only the five read tools above remain.
+    if not settings.read_only:
 
-        The destination must be a folder, not a label — "moving" into a label is
-        really applying it (use a Proton client). Returns per-UID success/failure
-        so partial moves are visible. UIDs come from proton_list_messages /
-        proton_search_messages and are only valid for the folder they were read from.
-        """
-        return _dump(
-            await move_messages_impl(
-                imap,
-                uids=uids,
-                source_folder=source_folder,
-                destination_folder=destination_folder,
+        @mcp.tool()
+        async def proton_move_messages(
+            uids: list[int],
+            source_folder: str,
+            destination_folder: str,
+        ) -> str:
+            """Move messages from one folder to another (max 50 UIDs per call).
+
+            The destination must be a folder, not a label — "moving" into a label is
+            really applying it (use a Proton client). Returns per-UID success/failure
+            so partial moves are visible. UIDs come from proton_list_messages /
+            proton_search_messages and are only valid for the folder they were read from.
+            """
+            return _dump(
+                await move_messages_impl(
+                    imap,
+                    uids=uids,
+                    source_folder=source_folder,
+                    destination_folder=destination_folder,
+                )
             )
-        )
 
-    @mcp.tool()
-    async def proton_mark_messages(
-        uids: list[int],
-        folder: str,
-        mark: MarkAction,
-    ) -> str:
-        """Mark messages read/unread or flagged/unflagged (idempotent, max 50 UIDs).
+        @mcp.tool()
+        async def proton_mark_messages(
+            uids: list[int],
+            folder: str,
+            mark: MarkAction,
+        ) -> str:
+            """Mark messages read/unread or flagged/unflagged (idempotent, max 50 UIDs).
 
-        `mark` is one of: read, unread, flagged, unflagged. Returns per-UID
-        success/failure.
-        """
-        return _dump(await mark_messages_impl(imap, uids=uids, folder=folder, mark=mark))
-
-    @mcp.tool(annotations=_DESTRUCTIVE)
-    async def proton_delete_messages(
-        uids: list[int],
-        folder: str,
-    ) -> str:
-        """Delete messages by moving them to Trash (max 50 UIDs per call).
-
-        Delete is soft: messages move to Trash, never expunged. Deleting *from*
-        Trash or Spam is refused — empty those from a Proton client. Every delete
-        is recorded in the audit log. Returns per-UID success/failure.
-        """
-        return _dump(await delete_messages_impl(settings, imap, uids=uids, folder=folder))
-
-    @mcp.tool()
-    async def proton_create_folder(
-        name: str,
-        kind: Literal["folder", "label"] = "folder",
-        parent: str | None = None,
-    ) -> str:
-        """Create a folder or label under the correct Proton namespace.
-
-        `kind` is 'folder' or 'label'. `parent` (folders only) nests the new
-        folder under an existing folder; labels cannot be nested.
-        """
-        return _dump(await create_folder_impl(imap, name=name, kind=kind, parent=parent))
-
-    @mcp.tool()
-    async def proton_save_draft(
-        to: list[str] | None = None,
-        cc: list[str] | None = None,
-        bcc: list[str] | None = None,
-        subject: str = "",
-        body_text: str = "",
-        in_reply_to_uid: int | None = None,
-        in_reply_to_folder: str | None = None,
-    ) -> str:
-        """Save a draft email to Drafts — the PREFERRED way to compose.
-
-        Prefer this over proton_send_message: a draft is reviewable in any Proton
-        client and a human sends it, so nothing leaves the account automatically.
-        Provide at least one recipient (to/cc/bcc). To reply to an existing
-        message, pass BOTH in_reply_to_uid and in_reply_to_folder (from
-        proton_list_messages / proton_search_messages) — In-Reply-To/References
-        and a single 'Re:' subject are set for you. Returns the new draft's UID
-        and Message-ID.
-        """
-        return _dump(
-            await save_draft_impl(
-                settings,
-                imap,
-                to=to,
-                cc=cc,
-                bcc=bcc,
-                subject=subject,
-                body_text=body_text,
-                in_reply_to_uid=in_reply_to_uid,
-                in_reply_to_folder=in_reply_to_folder,
-            )
-        )
-
-    # Layer 1 of the send gate (§7.1): proton_send_message is registered ONLY
-    # when COMLINK_ALLOW_SEND=true, so with the gate off the tool is invisible
-    # to the client — not registered-then-refusing.
-    if settings.allow_send:
+            `mark` is one of: read, unread, flagged, unflagged. Returns per-UID
+            success/failure.
+            """
+            return _dump(await mark_messages_impl(imap, uids=uids, folder=folder, mark=mark))
 
         @mcp.tool(annotations=_DESTRUCTIVE)
-        async def proton_send_message(
-            confirm: bool,
+        async def proton_delete_messages(
+            uids: list[int],
+            folder: str,
+        ) -> str:
+            """Delete messages by moving them to Trash (max 50 UIDs per call).
+
+            Delete is soft: messages move to Trash, never expunged. Deleting *from*
+            Trash or Spam is refused — empty those from a Proton client. Every delete
+            is recorded in the audit log. Returns per-UID success/failure.
+            """
+            return _dump(await delete_messages_impl(settings, imap, uids=uids, folder=folder))
+
+        @mcp.tool()
+        async def proton_create_folder(
+            name: str,
+            kind: Literal["folder", "label"] = "folder",
+            parent: str | None = None,
+        ) -> str:
+            """Create a folder or label under the correct Proton namespace.
+
+            `kind` is 'folder' or 'label'. `parent` (folders only) nests the new
+            folder under an existing folder; labels cannot be nested.
+            """
+            return _dump(await create_folder_impl(imap, name=name, kind=kind, parent=parent))
+
+        @mcp.tool()
+        async def proton_save_draft(
             to: list[str] | None = None,
             cc: list[str] | None = None,
             bcc: list[str] | None = None,
@@ -798,30 +803,71 @@ def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
             in_reply_to_uid: int | None = None,
             in_reply_to_folder: str | None = None,
         ) -> str:
-            """Send an email via Proton Mail Bridge (gated, allowlisted, rate-limited).
+            """Save a draft email to Drafts — the PREFERRED way to compose.
 
-            Prefer proton_save_draft unless an immediate send is explicitly
-            wanted. `confirm` must be true — set it only when a human has
-            approved THIS exact outbound message. Recipients must pass the
-            configured allowlist and the hourly rate limit. To reply, pass BOTH
-            in_reply_to_uid and in_reply_to_folder. Proton saves the Sent copy
-            server-side. Returns the sent Message-ID and recipients.
+            Prefer this over proton_send_message: a draft is reviewable in any Proton
+            client and a human sends it, so nothing leaves the account automatically.
+            Provide at least one recipient (to/cc/bcc). To reply to an existing
+            message, pass BOTH in_reply_to_uid and in_reply_to_folder (from
+            proton_list_messages / proton_search_messages) — In-Reply-To/References
+            and a single 'Re:' subject are set for you. Returns the new draft's UID
+            and Message-ID.
             """
             return _dump(
-                await send_message_impl(
+                await save_draft_impl(
                     settings,
                     imap,
-                    rate_limiter,
                     to=to,
                     cc=cc,
                     bcc=bcc,
                     subject=subject,
                     body_text=body_text,
-                    confirm=confirm,
                     in_reply_to_uid=in_reply_to_uid,
                     in_reply_to_folder=in_reply_to_folder,
                 )
             )
+
+        # Layer 1 of the send gate (§7.1): proton_send_message is registered ONLY
+        # when COMLINK_ALLOW_SEND=true, so with the gate off the tool is invisible
+        # to the client — not registered-then-refusing. It is therefore DOUBLY
+        # gated: read_only OR not allow_send → not registered.
+        if settings.allow_send:
+
+            @mcp.tool(annotations=_DESTRUCTIVE)
+            async def proton_send_message(
+                confirm: bool,
+                to: list[str] | None = None,
+                cc: list[str] | None = None,
+                bcc: list[str] | None = None,
+                subject: str = "",
+                body_text: str = "",
+                in_reply_to_uid: int | None = None,
+                in_reply_to_folder: str | None = None,
+            ) -> str:
+                """Send an email via Proton Mail Bridge (gated, allowlisted, rate-limited).
+
+                Prefer proton_save_draft unless an immediate send is explicitly
+                wanted. `confirm` must be true — set it only when a human has
+                approved THIS exact outbound message. Recipients must pass the
+                configured allowlist and the hourly rate limit. To reply, pass BOTH
+                in_reply_to_uid and in_reply_to_folder. Proton saves the Sent copy
+                server-side. Returns the sent Message-ID and recipients.
+                """
+                return _dump(
+                    await send_message_impl(
+                        settings,
+                        imap,
+                        rate_limiter,
+                        to=to,
+                        cc=cc,
+                        bcc=bcc,
+                        subject=subject,
+                        body_text=body_text,
+                        confirm=confirm,
+                        in_reply_to_uid=in_reply_to_uid,
+                        in_reply_to_folder=in_reply_to_folder,
+                    )
+                )
 
     return mcp
 

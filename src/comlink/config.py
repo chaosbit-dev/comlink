@@ -44,12 +44,21 @@ class ComlinkSettings(BaseSettings):
         ),
     )
 
+    read_only: bool = False
+
     allow_send: bool = False
     send_allowlist: str = ""
     send_max_per_hour: int = 5
     audit_log: Path = Path("~/.comlink/audit.jsonl")
 
     transport: Literal["stdio", "streamable-http"] = "stdio"
+    http_host: str = "127.0.0.1"
+    http_port: int = 8000
+    http_path: str = "/mcp"
+    # Comma-separated Host allowlist for DNS-rebinding protection on the
+    # streamable-http transport (design doc §2 Phase 2). Empty disables the
+    # check — acceptable behind Cloudflare Access, never for bare-internet.
+    http_allowed_hosts: str = ""
 
     @model_validator(mode="after")
     def _refuse_no_verify_off_localhost(self) -> ComlinkSettings:
@@ -124,6 +133,15 @@ class ComlinkSettings(BaseSettings):
     def parsed_allowlist(self) -> list[str]:
         """Comma-separated allowlist → normalized list (lowercased, blanks dropped)."""
         return [item.strip().lower() for item in self.send_allowlist.split(",") if item.strip()]
+
+    def parsed_http_allowed_hosts(self) -> list[str]:
+        """Comma-separated Host allowlist → list (stripped, blanks dropped).
+
+        Host headers are case-insensitive but preserved as written here; the
+        transport-security layer compares them. Empty list disables DNS-rebinding
+        protection (design doc §2 Phase 2).
+        """
+        return [item.strip() for item in self.http_allowed_hosts.split(",") if item.strip()]
 
     def build_ssl_context(self) -> ssl.SSLContext:
         """SSL context for STARTTLS against the Bridge (design doc §3.4)."""
