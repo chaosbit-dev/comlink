@@ -9,9 +9,12 @@
 # build as the smoke test.
 
 # ---- Stage 1: builder -------------------------------------------------------
-# Pin uv via its official distroless image, copied onto a python base. Using the
-# python:3.12-slim base keeps the resolved interpreter identical between stages.
-FROM ghcr.io/astral-sh/uv:0.11-python3.12-bookworm-slim AS builder
+# uv's official image with Python 3.12 baked in (bookworm-slim base, matching
+# stage 2's python:3.12-slim-bookworm so the resolved interpreter is identical).
+# This tag tracks the latest uv — a build tool whose exact version isn't
+# runtime-critical; pin to a specific uv release (e.g. :0.5.x-python3.12-...) if
+# you want fully reproducible builds.
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
 # uv build-time behavior:
 #   - compile bytecode for faster cold starts
