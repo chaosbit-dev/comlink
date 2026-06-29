@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -44,6 +44,9 @@ from comlink.models import (
     SendGateStatus,
     SendResult,
 )
+
+if TYPE_CHECKING:
+    from starlette.types import ASGIApp
 
 logger = logging.getLogger("comlink.server")
 
@@ -636,6 +639,18 @@ def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
             "to restrict outbound mail."
         )
 
+    # INFO-1: the Access gate middleware only wires into the streamable-http path
+    # (_run_http). On stdio (or any non-http transport) it is never installed, so
+    # COMLINK_REQUIRE_ACCESS_JWT=true silently does nothing — warn rather than imply
+    # protection that is not there.
+    if settings.require_access_jwt and settings.transport != "streamable-http":
+        logger.warning(
+            "COMLINK_REQUIRE_ACCESS_JWT=true but COMLINK_TRANSPORT=%s: the Cloudflare "
+            "Access gate only applies to the streamable-http transport and is a no-op "
+            "here. Set COMLINK_TRANSPORT=streamable-http or disable the gate.",
+            settings.transport,
+        )
+
     @mcp.tool(annotations=_READ_ONLY)
     async def proton_health_check() -> str:
         """Verify IMAP + SMTP connectivity to Proton Mail Bridge. Reports Bridge
@@ -884,11 +899,68 @@ def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
     return mcp
 
 
+def _run_http(server: FastMCP, settings: ComlinkSettings) -> None:
+    """Serve the streamable-http app, gated by Cloudflare Access when enabled (Epic 5).
+
+    Builds the Starlette app from the already-configured FastMCP instance, optionally
+    wraps it with the Access JWT middleware, and serves it via uvicorn — mirroring
+    FastMCP.run_streamable_http_async so session/lifespan behavior is unchanged.
+
+    The DNS-rebinding transport security set in create_server is preserved: FastMCP's
+    streamable_http_app() builds its session manager from settings.transport_security,
+    which create_server already populated via the FastMCP constructor. Wrapping the
+    whole app on the outside does not disturb it (lifespan and HTTP scopes both reach
+    the inner app), so no re-setting is required here.
+    """
+    import uvicorn
+
+    from comlink.access import CloudflareAccessMiddleware, CloudflareAccessValidator
+
+    app: ASGIApp = server.streamable_http_app()
+    if settings.require_access_jwt:
+        logger.info(
+            "Cloudflare Access JWT gate ENABLED: validating Cf-Access-Jwt-Assertion "
+            "(aud=%s, team=%s, email_allowlist=%d entr%s).",
+            settings.access_aud,
+            settings.access_team_domain,
+            len(settings.access_allowed_emails),
+            "y" if len(settings.access_allowed_emails) == 1 else "ies",
+        )
+        # LOW-1: gate ON with an empty email allowlist is an acceptable fail-safe
+        # default (real emails live in deployment.yaml), but it means any
+        # Cloudflare-authenticated principal passes — make that audible. No email
+        # values are logged.
+        if not settings.access_allowed_emails:
+            logger.warning(
+                "Access gate ON but no email allowlist (COMLINK_ACCESS_ALLOWED_EMAILS "
+                "empty); any Cloudflare-authenticated identity is accepted. Set "
+                "COMLINK_ACCESS_ALLOWED_EMAILS to restrict to specific principals."
+            )
+        app = CloudflareAccessMiddleware(app, CloudflareAccessValidator(settings))
+    else:
+        logger.warning(
+            "Cloudflare Access JWT gate DISABLED (COMLINK_REQUIRE_ACCESS_JWT not true). "
+            "The origin trusts the network for authentication — only acceptable when "
+            "Cloudflare Access reliably fronts every path to this listener."
+        )
+
+    config = uvicorn.Config(
+        app,
+        host=settings.http_host,
+        port=settings.http_port,
+        log_level="info",
+    )
+    uvicorn.Server(config).run()
+
+
 def main() -> None:
     """Console entry point (`comlink = "comlink.server:main"`)."""
     settings = load_settings()
     server = create_server(settings)
-    server.run(transport=settings.transport)
+    if settings.transport == "streamable-http":
+        _run_http(server, settings)
+    else:
+        server.run()
 
 
 if __name__ == "__main__":

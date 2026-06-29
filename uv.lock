@@ -180,10 +180,13 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosmtplib" },
     { name = "anyio" },
+    { name = "httpx" },
     { name = "imapclient" },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pyjwt", extra = ["crypto"] },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -198,10 +201,13 @@ dev = [
 requires-dist = [
     { name = "aiosmtplib", specifier = ">=3.0.0" },
     { name = "anyio", specifier = ">=4.4.0" },
+    { name = "httpx", specifier = ">=0.28.0" },
     { name = "imapclient", specifier = ">=3.0.1" },
     { name = "mcp", specifier = ">=1.2.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "pydantic-settings", specifier = ">=2.3.0" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.0" },
+    { name = "uvicorn", specifier = ">=0.30.0" },
 ]
 
 [package.metadata.requires-dev]
