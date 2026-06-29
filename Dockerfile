@@ -1,12 +1,11 @@
-# Comlink — read-only Proton Mail MCP server, containerized for K3s on Gonk.
+# Comlink — Proton Mail MCP server, containerized for K3s on Gonk.
 #
 # Multi-stage, uv-based, non-root. Stage 1 resolves the frozen dependency graph
 # from uv.lock into a self-contained /app/.venv; stage 2 is a slim runtime that
 # carries only the venv + source (no uv, no build toolchain, no dev deps).
 #
-# NOTE: This image was NOT build-tested in the authoring environment (no usable
-# docker build there). Build it on Gonk per deploy/README.md and treat the first
-# build as the smoke test.
+# Build + deploy live in the gonk-infra repo (k8s/workloads/comlink/README.md):
+# build --platform linux/amd64, import into k3s containerd, kubectl apply -k.
 
 # ---- Stage 1: builder -------------------------------------------------------
 # uv's official image with Python 3.12 baked in (bookworm-slim base, matching
