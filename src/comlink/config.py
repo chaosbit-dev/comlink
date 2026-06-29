@@ -34,7 +34,14 @@ class ComlinkSettings(BaseSettings):
     password: SecretStr | None = None
     password_command: str | None = None
 
-    tls_mode: Literal["verify", "no-verify"] = "verify"
+    # DESIGN-GAP: design doc §3.4/§5 enumerate only "verify" | "no-verify". Epic 5
+    # (durable K3s deploy, design doc line 246 "revisit TLS pinning against the Gonk
+    # Bridge cert") needs a third mode: the Bridge cert is self-signed for
+    # localhost/127.0.0.1, not the in-cluster service DNS name, so plain "verify"
+    # fails hostname matching even with the cert pinned, and "no-verify" is illegal
+    # off-localhost. "verify-no-hostname" pins the cert (CERT_REQUIRED against
+    # COMLINK_TLS_CERT_PATH) but skips the hostname check.
+    tls_mode: Literal["verify", "no-verify", "verify-no-hostname"] = "verify"
     tls_cert_path: Path | None = None
     smtp_security: Literal["starttls", "ssl"] = Field(
         default="starttls",
@@ -71,6 +78,23 @@ class ComlinkSettings(BaseSettings):
                         f"'{host}' is not localhost. Use COMLINK_TLS_MODE=verify with "
                         "COMLINK_TLS_CERT_PATH pointing at the pinned Bridge certificate."
                     )
+        return self
+
+    @model_validator(mode="after")
+    def _require_cert_for_verify_no_hostname(self) -> ComlinkSettings:
+        """``verify-no-hostname`` MUST pin a cert (design doc line 246, Epic 5).
+
+        Without ``COMLINK_TLS_CERT_PATH`` the context would chain against the system
+        CAs, which do not know the self-signed Bridge cert — and with the hostname
+        check disabled that degrades to near-``no-verify`` blanket trust. Refuse it.
+        """
+        if self.tls_mode == "verify-no-hostname" and self.tls_cert_path is None:
+            raise ValueError(
+                "COMLINK_TLS_MODE=verify-no-hostname requires COMLINK_TLS_CERT_PATH "
+                "to pin the self-signed Bridge certificate. Without a pinned cert the "
+                "connection would trust any system-CA-chained certificate while skipping "
+                "the hostname check. Set COMLINK_TLS_CERT_PATH to the mounted Bridge cert."
+            )
         return self
 
     def resolve_password(self) -> str:
@@ -151,6 +175,16 @@ class ComlinkSettings(BaseSettings):
             context.verify_mode = ssl.CERT_NONE
             return context
         cafile = str(self.tls_cert_path) if self.tls_cert_path is not None else None
+        if self.tls_mode == "verify-no-hostname":
+            # Pin the self-signed Bridge cert (CERT_REQUIRED, chained to cafile) but
+            # skip hostname matching: Bridge issues for localhost/127.0.0.1, not the
+            # in-cluster service DNS name. create_default_context leaves verify_mode at
+            # CERT_REQUIRED; clearing check_hostname while CERT_REQUIRED is valid and
+            # raises no error (only the inverse — CERT_NONE with check_hostname True —
+            # would). cafile is guaranteed non-None by _require_cert_for_verify_no_hostname.
+            context = ssl.create_default_context(cafile=cafile)
+            context.check_hostname = False
+            return context
         return ssl.create_default_context(cafile=cafile)
 
 

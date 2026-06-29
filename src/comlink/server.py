@@ -119,17 +119,29 @@ async def health_check_impl(
     except Exception as exc:  # health check must report, not crash
         imap_status = EndpointStatus(ok=False, error=redacted_message(exc, _raw_secrets(settings)))
 
-    try:
-        password = settings.resolve_password()
-        await verify_smtp_connectivity(settings, password)
-        smtp_status = EndpointStatus(ok=True)
-    except ComlinkError as exc:
-        smtp_status = EndpointStatus(ok=False, error=str(exc))
-    except Exception as exc:  # health check must report, not crash
-        smtp_status = EndpointStatus(ok=False, error=redacted_message(exc, _raw_secrets(settings)))
+    # In read-only mode no send tool is registered, so SMTP is never exercised —
+    # probing it surfaces a misleading failure on an otherwise-healthy deploy. Skip
+    # the probe and let bridge_reachable rest on IMAP alone (don't let a skipped SMTP
+    # drag it down or falsely prop it up).
+    smtp_status: EndpointStatus | None
+    if settings.read_only:
+        smtp_status = None
+        bridge_reachable = imap_status.ok
+    else:
+        try:
+            password = settings.resolve_password()
+            await verify_smtp_connectivity(settings, password)
+            smtp_status = EndpointStatus(ok=True)
+        except ComlinkError as exc:
+            smtp_status = EndpointStatus(ok=False, error=str(exc))
+        except Exception as exc:  # health check must report, not crash
+            smtp_status = EndpointStatus(
+                ok=False, error=redacted_message(exc, _raw_secrets(settings))
+            )
+        bridge_reachable = imap_status.ok or smtp_status.ok
 
     report = HealthReport(
-        bridge_reachable=imap_status.ok or smtp_status.ok,
+        bridge_reachable=bridge_reachable,
         imap=imap_status,
         smtp=smtp_status,
         account=settings.username or "(COMLINK_USERNAME not set)",
