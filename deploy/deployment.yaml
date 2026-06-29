@@ -39,7 +39,7 @@ spec:
           # image and never reaches out to a registry for this tag. The tag here
           # MUST match the tag used in `docker save` / `ctr images import`
           # (see deploy/README.md) or the pod will ImagePullBackOff.
-          image: comlink:0.1.0
+          image: comlink:0.2.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -93,13 +93,12 @@ spec:
               value: "chaosbit.cloudflareaccess.com"
             - name: COMLINK_ACCESS_ALLOWED_EMAILS
               value: "brandon@chaosbit.dev,brandon.luttrell@att.net"
-            # STAYS false until we confirm OUT-OF-BAND that Cloudflare injects the
-            # Cf-Access-Jwt-Assertion header on the Claude-app Managed-OAuth path.
-            # Flipping to true before that is verified would 401-block the working
-            # read path. The middleware logs a WARNING on every header-less request,
-            # which is the signal to watch before flipping this.
+            # Cloudflare Access JWT gate ENABLED: the middleware re-validates the
+            # Cf-Access-Jwt-Assertion (RS256 sig + aud + iss + exp) in-process on
+            # every request, so a direct in-cluster hit on the ClusterIP can't bypass
+            # edge auth. Requires AUD + TEAM_DOMAIN above (config fails fast otherwise).
             - name: COMLINK_REQUIRE_ACCESS_JWT
-              value: "false"
+              value: "true"
             # --- Bridge app password from the Secret --------------------------
             - name: COMLINK_PASSWORD
               valueFrom:
