@@ -162,7 +162,11 @@ class HealthReport(ComlinkModel):
 
     bridge_reachable: bool
     imap: EndpointStatus
-    smtp: EndpointStatus
+    # None when the SMTP probe was skipped: in read-only mode no send tool is
+    # registered, so SMTP is never used and a failed probe would be misleading
+    # noise. ``bridge_reachable`` then reflects IMAP alone. Non-read-only deploys
+    # always probe SMTP and report an EndpointStatus here.
+    smtp: EndpointStatus | None = None
     account: str
     folder_count: int | None = None
     # When true, only the five read tools are registered; all write/organize/

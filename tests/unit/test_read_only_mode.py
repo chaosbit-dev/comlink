@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from comlink.errors import ComlinkError
 from comlink.guardrails import RateLimiter
 from comlink.server import create_server, health_check_impl
 
@@ -83,22 +84,82 @@ class TestReadOnlyRegistration:
         assert off == on == READ_TOOLS
 
 
+class _OkImap:
+    async def verify_connectivity(self) -> int:
+        return 7
+
+
+class _DownImap:
+    async def verify_connectivity(self) -> int:
+        raise RuntimeError("bridge down")
+
+
 class TestHealthReportReadOnlyField:
     async def test_health_report_surfaces_read_only_true(self) -> None:
-        class _FakeImap:
-            async def verify_connectivity(self) -> int:
-                return 7
-
         settings = make_settings(read_only=True)
-        # SMTP verify will fail (no Bridge) but health_check reports rather than raises.
-        report = await health_check_impl(settings, _FakeImap(), RateLimiter())  # type: ignore[arg-type]
+        report = await health_check_impl(settings, _OkImap(), RateLimiter())  # type: ignore[arg-type]
         assert report["read_only"] is True
 
     async def test_health_report_surfaces_read_only_false(self) -> None:
-        class _FakeImap:
-            async def verify_connectivity(self) -> int:
-                return 7
-
         settings = make_settings(read_only=False)
-        report = await health_check_impl(settings, _FakeImap(), RateLimiter())  # type: ignore[arg-type]
+        report = await health_check_impl(settings, _OkImap(), RateLimiter())  # type: ignore[arg-type]
         assert report["read_only"] is False
+
+
+class TestHealthReportSmtpSkip:
+    """Read-only deploys register no send tool, so the SMTP probe is skipped: SMTP is
+    reported as 'not checked' (None), and reachability rests on IMAP alone — a skipped
+    SMTP neither drags bridge_reachable down nor falsely props it up (Epic 5)."""
+
+    async def test_read_only_skips_smtp_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # If the probe ran it would explode the test — proving it is never called.
+        async def _explode(*args: object, **kwargs: object) -> None:
+            raise AssertionError("SMTP probe must be skipped in read-only mode")
+
+        monkeypatch.setattr("comlink.server.verify_smtp_connectivity", _explode)
+        settings = make_settings(read_only=True)
+        report = await health_check_impl(settings, _OkImap(), RateLimiter())  # type: ignore[arg-type]
+        assert report["smtp"] is None
+
+    async def test_read_only_reachability_follows_imap_ok(self) -> None:
+        settings = make_settings(read_only=True)
+        report = await health_check_impl(settings, _OkImap(), RateLimiter())  # type: ignore[arg-type]
+        assert report["smtp"] is None
+        assert report["bridge_reachable"] is True
+        assert report["imap"]["ok"] is True
+
+    async def test_read_only_skipped_smtp_does_not_prop_up_dead_imap(self) -> None:
+        # IMAP down + SMTP skipped → not reachable. The skipped SMTP must not mask it.
+        settings = make_settings(read_only=True)
+        report = await health_check_impl(settings, _DownImap(), RateLimiter())  # type: ignore[arg-type]
+        assert report["smtp"] is None
+        assert report["imap"]["ok"] is False
+        assert report["bridge_reachable"] is False
+
+    async def test_non_read_only_probes_smtp(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        probed = False
+
+        async def _probe(*args: object, **kwargs: object) -> None:
+            nonlocal probed
+            probed = True
+
+        monkeypatch.setattr("comlink.server.verify_smtp_connectivity", _probe)
+        settings = make_settings(read_only=False)
+        report = await health_check_impl(settings, _OkImap(), RateLimiter())  # type: ignore[arg-type]
+        assert probed is True
+        assert report["smtp"] == {"ok": True, "error": None}
+        assert report["bridge_reachable"] is True
+
+    async def test_non_read_only_smtp_failure_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _fail(*args: object, **kwargs: object) -> None:
+            raise ComlinkError("smtp unreachable")
+
+        monkeypatch.setattr("comlink.server.verify_smtp_connectivity", _fail)
+        settings = make_settings(read_only=False)
+        report = await health_check_impl(settings, _OkImap(), RateLimiter())  # type: ignore[arg-type]
+        assert report["smtp"]["ok"] is False
+        assert report["smtp"]["error"] == "smtp unreachable"
+        # IMAP is up, so bridge is still reachable despite the SMTP failure.
+        assert report["bridge_reachable"] is True
