@@ -20,6 +20,8 @@ import jwt
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from comlink.audit_context import reset_principal, set_principal
+
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -217,12 +219,30 @@ class CloudflareAccessMiddleware:
             return
 
         try:
-            await self._validator.validate(token)
+            claims = await self._validator.validate(token)
         except AccessValidationError:
             await self._reject(scope, receive, send, "invalid access assertion")
             return
 
-        await self._app(scope, receive, send)
+        # Record the authenticated principal for audit attribution (§6). The audit
+        # builder reads it from the contextvar so a send/delete driven by this request
+        # is traceable to a concrete identity, not just the transport. Reset on the way
+        # out so the binding never leaks past this request's scope.
+        principal_token = set_principal(self._principal_from_claims(claims))
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            reset_principal(principal_token)
+
+    @staticmethod
+    def _principal_from_claims(claims: dict[str, Any]) -> str | None:
+        """Pick the audit principal from validated claims: email, else Access subject.
+
+        Both are non-secret identifiers (safe to log). ``None`` only if neither claim
+        is present — the validator already enforces an optional email allowlist.
+        """
+        principal = claims.get("email") or claims.get("sub")
+        return str(principal) if principal is not None else None
 
     @staticmethod
     async def _reject(scope: Scope, receive: Receive, send: Send, detail: str) -> None:

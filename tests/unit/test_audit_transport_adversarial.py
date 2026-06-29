@@ -72,6 +72,34 @@ class TestTransportInWrittenLine:
         assert entries[0]["transport"] == "stdio"
         assert entries[0]["action"] == "send"
 
+    async def test_streamable_http_written_line_records_real_transport(
+        self, tmp_path: Path, fake_send: list[str]
+    ) -> None:
+        # M1: on the COMLINK_TRANSPORT=streamable-http deployment the audit line must
+        # record the REAL transport, not the old hardcoded "stdio" — this is exactly
+        # the remote, injection-exposed deployment where attribution matters.
+        settings = make_settings(
+            transport="streamable-http",
+            username="brandon@chaosbit.dev",
+            password=_PASSWORD,
+            send_allowlist="*@chaosbit.dev",
+            audit_log=tmp_path / "audit.jsonl",
+        )
+        await send_message_impl(
+            settings,
+            object(),  # type: ignore[arg-type]
+            RateLimiter(),
+            to=["kendra@chaosbit.dev"],
+            subject="hello",
+            body_text=_BODY,
+            confirm=True,
+        )
+        entries = _audit_lines(tmp_path / "audit.jsonl")
+        assert len(entries) == 1
+        assert entries[0]["transport"] == "streamable-http"
+        # No authenticated request context in this unit path => principal None.
+        assert entries[0]["principal"] is None
+
     async def test_secret_looking_subject_keeps_no_body_no_password_guarantee(
         self, tmp_path: Path, fake_send: list[str]
     ) -> None:

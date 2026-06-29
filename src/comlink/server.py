@@ -355,6 +355,7 @@ async def delete_messages_impl(
             result.folder,
             result.succeeded,
             [item.uid for item in result.failed],
+            transport=settings.transport,
         ),
     )
     payload = result.model_dump()
@@ -562,7 +563,12 @@ async def send_message_impl(
         raise
     append_audit(
         settings,
-        send_audit_entry(envelope_recipients, str(message["Subject"]), message_id),
+        send_audit_entry(
+            envelope_recipients,
+            str(message["Subject"]),
+            message_id,
+            transport=settings.transport,
+        ),
     )
     return SendResult(message_id=message_id, recipients=envelope_recipients).model_dump()
 
