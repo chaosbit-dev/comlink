@@ -48,7 +48,7 @@ spec:
           env:
             # --- Account + Bridge endpoint (in-cluster Service) ---------------
             - name: COMLINK_USERNAME
-              value: "baluttrell"
+              value: "brandon@chaosbit.dev"
             - name: COMLINK_IMAP_HOST
               value: "proton-bridge.proton-bridge.svc.cluster.local"
             - name: COMLINK_IMAP_PORT
