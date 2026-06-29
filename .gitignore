@@ -29,3 +29,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Cloudflare Access app config backups (local only — contain infra config)
+experiments/auth_probe/*app_backup.json
