@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommits"],
+  "timezone": "America/Chicago",
+  "schedule": ["* 4-7 * * 1"],
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 0,
+  "commitMessagePrefix": "chore(deps):",
+  "dependencyDashboardTitle": "Renovate — outstanding dependency updates",
+  "description": [
+    "Renovate runs from the CENTRAL workflow in chaosbit-dev/gonk-infra (.github/workflows/renovate.yml) — there is no renovate.yml in this repo. This file says only WHAT to update here; the runner, its schedule and RENOVATE_TOKEN live there. Removing this repo from RENOVATE_REPOSITORIES in that workflow silently stops all updates here.",
+    "Division of labour with sentinel: Trivy Operator scans the image this repo builds once it is RUNNING on the cluster, including base-OS CVEs. Renovate covers the source side Trivy structurally cannot see — the workflow supply chain, and base images before they ship."
+  ],
+  "packageRules": [
+    {
+      "description": "Pin GitHub Actions to a commit SHA, matching the convention in gonk-infra. Actions never become a running container image, so Trivy never sees them, yet they execute with this repo's token and registry credentials.",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true,
+      "groupName": "github actions"
+    },
+    {
+      "description": "Base images get their OWN PR, never grouped. A Python minor bump is a judgement call rather than a routine patch, and multi-stage builder/runtime stages must move together or the build breaks in a way CI catches late.",
+      "matchManagers": ["dockerfile"],
+      "groupName": null,
+      "labels": ["needs-judgement"]
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "labels": ["security"],
+    "schedule": ["at any time"]
+  },
+  "osvVulnerabilityAlerts": true
+}
