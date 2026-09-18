@@ -41,7 +41,7 @@ import logging
 import os
 from datetime import UTC, datetime
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -65,7 +65,7 @@ def _transport_security() -> TransportSecuritySettings:
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     name="comlink_auth_probe",
     instructions="A disposable probe to verify the Cloudflare Access + Managed OAuth path.",
     host=os.environ.get("PROBE_HOST", "127.0.0.1"),
