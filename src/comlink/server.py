@@ -1,4 +1,4 @@
-"""FastMCP app, tool registration, transport selection (design doc §4, §6)."""
+"""MCPServer app, tool registration, transport selection (design doc §4, §6)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
@@ -58,8 +58,10 @@ DEFAULT_MAX_BODY_CHARS = 5000
 MAX_SEARCH_RESULTS = 250
 MAX_BATCH_UIDS = 50
 
-_READ_ONLY = ToolAnnotations(readOnlyHint=True)
-_DESTRUCTIVE = ToolAnnotations(destructiveHint=True)
+# mcp 2.x renamed these fields from camelCase to snake_case (readOnlyHint ->
+# read_only_hint). The wire format is unchanged; only the Python kwarg moved.
+_READ_ONLY = ToolAnnotations(read_only_hint=True)
+_DESTRUCTIVE = ToolAnnotations(destructive_hint=True)
 
 
 def clamp_pagination(limit: int, offset: int) -> tuple[int, int]:
@@ -602,20 +604,27 @@ def _build_transport_security(settings: ComlinkSettings) -> TransportSecuritySet
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
+def _http_app_kwargs(settings: ComlinkSettings) -> dict[str, Any]:
+    """Transport configuration for streamable_http_app() (mcp 2.x).
+
+    In 1.x these were constructor arguments; 2.x moved them onto the app/run
+    methods. Port is deliberately absent — uvicorn binds it in _run_http, and
+    streamable_http_app() has no port parameter.
+    """
+    return {
+        "host": settings.http_host,
+        "streamable_http_path": settings.http_path,
+        "transport_security": _build_transport_security(settings),
+    }
+
+
+def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
     settings = settings if settings is not None else load_settings()
-    # The stdio transport (default) takes no HTTP settings — keep its construction
-    # unchanged. Only the streamable-http transport (Phase 2, design doc §2/§5) gets
-    # the bind host/port, mount path, and DNS-rebinding transport security.
-    http_kwargs: dict[str, Any] = {}
-    if settings.transport == "streamable-http":
-        http_kwargs = {
-            "host": settings.http_host,
-            "port": settings.http_port,
-            "streamable_http_path": settings.http_path,
-            "transport_security": _build_transport_security(settings),
-        }
-    mcp = FastMCP(
+    # mcp 2.x moved ALL transport configuration off the constructor and onto
+    # streamable_http_app()/run_streamable_http_async(). There is therefore no
+    # http_kwargs here any more — see _http_app_kwargs, which _run_http applies.
+    # Nothing about the stdio path changes: it never took HTTP settings.
+    mcp = MCPServer(
         SERVER_NAME,
         instructions=(
             "Comlink: Proton Mail access via Proton Mail Bridge. Folder and label "
@@ -629,7 +638,6 @@ def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
             "expunges, so deleting from Trash or Spam is refused (empty those in a "
             "Proton client)."
         ),
-        **http_kwargs,
     )
     imap = ImapConnectionManager(settings)
     # One process-lifetime rate limiter shared by the send tool and the health
@@ -905,24 +913,28 @@ def create_server(settings: ComlinkSettings | None = None) -> FastMCP:
     return mcp
 
 
-def _run_http(server: FastMCP, settings: ComlinkSettings) -> None:
+def _run_http(server: MCPServer, settings: ComlinkSettings) -> None:
     """Serve the streamable-http app, gated by Cloudflare Access when enabled (Epic 5).
 
-    Builds the Starlette app from the already-configured FastMCP instance, optionally
-    wraps it with the Access JWT middleware, and serves it via uvicorn — mirroring
-    FastMCP.run_streamable_http_async so session/lifespan behavior is unchanged.
+    Builds the Starlette app from the MCPServer instance, optionally wraps it with
+    the Access JWT middleware, and serves it via uvicorn — mirroring
+    MCPServer.run_streamable_http_async so session/lifespan behavior is unchanged.
 
-    The DNS-rebinding transport security set in create_server is preserved: FastMCP's
-    streamable_http_app() builds its session manager from settings.transport_security,
-    which create_server already populated via the FastMCP constructor. Wrapping the
-    whole app on the outside does not disturb it (lifespan and HTTP scopes both reach
-    the inner app), so no re-setting is required here.
+    (TRAP) Under mcp 1.x the DNS-rebinding transport security was passed to the
+    FastMCP *constructor* and streamable_http_app() picked it up from there. In 2.x
+    the constructor accepts no such argument and silently defaults to NO protection,
+    so it must be passed here explicitly. _http_app_kwargs is the single place that
+    builds it; do not inline these kwargs or the guarantee is one careless edit from
+    disappearing with every test still green.
+
+    Wrapping the app on the outside does not disturb the inner app (lifespan and HTTP
+    scopes both reach it), so no re-setting is required beyond those kwargs.
     """
     import uvicorn
 
     from comlink.access import CloudflareAccessMiddleware, CloudflareAccessValidator
 
-    app: ASGIApp = server.streamable_http_app()
+    app: ASGIApp = server.streamable_http_app(**_http_app_kwargs(settings))
     if settings.require_access_jwt:
         logger.info(
             "Cloudflare Access JWT gate ENABLED: validating Cf-Access-Jwt-Assertion "
