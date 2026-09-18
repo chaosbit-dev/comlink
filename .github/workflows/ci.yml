@@ -1,0 +1,74 @@
+# =============================================================================
+# Lint, type-check, and test on every PR (and on main).
+#
+# WHY THIS EXISTS: comlink previously had only build-push.yml, which triggers on
+# push to main and does nothing but build an image. A Docker build never imports
+# the application, so a dependency change that breaks every import still produces
+# a green build and a pushed image.
+#
+# That is not hypothetical. On 2026-09-18 a Renovate PR titled "Update dependency
+# mcp to v1.28.1 [SECURITY]" actually resolved mcp 1.26.0 -> 2.2.0 (the pyproject
+# constraint was an unbounded `mcp>=1.2.0`). mcp 2.x renamed FastMCP to MCPServer;
+# every import failed. It merged clean, built green, Flux rolled it out, and
+# comlink sat in CrashLoopBackOff. The sibling repo homeassistant-mcp took the
+# identical PR and caught it here, in CI, before merge.
+#
+# Mirrors homeassistant-mcp/.github/workflows/ci.yml and the CLAUDE.md dev loop:
+#     uv run ruff check .
+#     uv run mypy src
+#     uv run pytest -q
+#
+# No secrets and no tailnet access: everything runs against the checkout, so this
+# is unaffected by the org-secret visibility rules that gate build-push.yml.
+# =============================================================================
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to the same branch supersedes the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          # 3.12 to match the Dockerfile (python:3.12-slim-bookworm); building and
+          # testing on different minors is how a 3.13-only failure reaches prod.
+          python-version: "3.12"
+          enable-cache: true
+
+      # --locked fails if uv.lock is out of sync with pyproject.toml, so a
+      # dependency change that skipped `uv lock` is caught here rather than at
+      # image build time.
+      - name: Install dependencies
+        id: install
+        run: uv sync --locked
+
+      # Each check runs even if an earlier CHECK failed, so one run reports every
+      # problem rather than just the first. Gated on the install succeeding and on
+      # the job not being cancelled, which `always()` would wrongly ignore.
+      - name: Lint (ruff)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: uv run ruff check --output-format=github .
+
+      - name: Type-check (mypy --strict)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: uv run mypy src
+
+      - name: Tests (pytest)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: uv run pytest -q
