@@ -26,8 +26,11 @@ name: ci
 
 on:
   pull_request:
-  push:
-    branches: [main]
+  # Called by build-push.yml so the image is only published if these pass.
+  # Deliberately NOT triggered on push to main as well: build-push.yml
+  # already invokes it there, and having both would run the whole suite twice
+  # per merge. Mirrors hk47.
+  workflow_call:
 
 permissions:
   contents: read
