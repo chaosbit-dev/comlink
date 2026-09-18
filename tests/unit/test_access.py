@@ -580,7 +580,10 @@ class TestConfig:
 
 
 class _FakeServer:
-    def streamable_http_app(self) -> object:
+    # Accepts **kwargs because mcp 2.x moved host/streamable_http_path/
+    # transport_security onto streamable_http_app(); a zero-arg stub would fail
+    # with TypeError rather than exercising the wrapping logic under test.
+    def streamable_http_app(self, **kwargs: Any) -> object:
         return "inner-app"
 
 
@@ -669,7 +672,9 @@ class TestServerWiring:
         captured: dict[str, Any] = {}
 
         class _FakeServer:
-            def streamable_http_app(self) -> object:
+            # **kwargs: mcp 2.x passes host/streamable_http_path/transport_security
+            # to streamable_http_app(); see the module-level _FakeServer.
+            def streamable_http_app(self, **kwargs: Any) -> object:
                 return "inner-app"
 
         class _FakeUvicornServer:
