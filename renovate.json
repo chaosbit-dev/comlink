@@ -1,33 +1,48 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommits"],
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
   "timezone": "America/Chicago",
-  "schedule": ["* 4-7 * * 1"],
   "prConcurrentLimit": 3,
   "prHourlyLimit": 0,
   "commitMessagePrefix": "chore(deps):",
   "dependencyDashboardTitle": "Renovate — outstanding dependency updates",
   "description": [
     "Renovate runs from the CENTRAL workflow in chaosbit-dev/gonk-infra (.github/workflows/renovate.yml) — there is no renovate.yml in this repo. This file says only WHAT to update here; the runner, its schedule and RENOVATE_TOKEN live there. Removing this repo from RENOVATE_REPOSITORIES in that workflow silently stops all updates here.",
-    "Division of labour with sentinel: Trivy Operator scans the image this repo builds once it is RUNNING on the cluster, including base-OS CVEs. Renovate covers the source side Trivy structurally cannot see — the workflow supply chain, and base images before they ship."
+    "Division of labour with sentinel: Trivy Operator scans the image this repo builds once it is RUNNING on the cluster, including base-OS CVEs. Renovate covers the source side Trivy structurally cannot see — the workflow supply chain, and base images before they ship.",
+    "SCHEDULE REMOVED 2026-09-14. There is no renovate.yml in this repo — the central runner in gonk-infra is fired by a cron, and that cron IS the schedule. A second gate here let GitHub's scheduler drift silently veto every non-security update.",
+    "Evidence: the cron asks for 10:17 UTC but GitHub started it at 15:52 UTC (2026-09-07) and 16:22 UTC (2026-09-14), both outside the old '* 4-7 * * 1' window. Two weeks running, this repo's Actions digest-pinning updates were skipped with a green workflow. To change timing, change the cron in gonk-infra."
   ],
   "packageRules": [
     {
       "description": "Pin GitHub Actions to a commit SHA, matching the convention in gonk-infra. Actions never become a running container image, so Trivy never sees them, yet they execute with this repo's token and registry credentials.",
-      "matchManagers": ["github-actions"],
+      "matchManagers": [
+        "github-actions"
+      ],
       "pinDigests": true,
       "groupName": "github actions"
     },
     {
       "description": "Base images get their OWN PR, never grouped. A Python minor bump is a judgement call rather than a routine patch, and multi-stage builder/runtime stages must move together or the build breaks in a way CI catches late.",
-      "matchManagers": ["dockerfile"],
+      "matchManagers": [
+        "dockerfile"
+      ],
       "groupName": null,
-      "labels": ["needs-judgement"]
+      "labels": [
+        "needs-judgement"
+      ]
     }
   ],
   "vulnerabilityAlerts": {
-    "labels": ["security"],
-    "schedule": ["at any time"]
+    "labels": [
+      "security"
+    ],
+    "schedule": [
+      "at any time"
+    ]
   },
   "osvVulnerabilityAlerts": true
 }
