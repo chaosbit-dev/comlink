@@ -36,7 +36,17 @@ on:
     branches: [main]
 
 jobs:
+  # GATE. The template publishes unconditionally, which is fine for an image
+  # nobody auto-deploys — but Flux selects the newest tag on its own, so an
+  # unconditional push means a red build reaches the cluster unattended.
+  # That is not hypothetical: on 2026-09-18 an unmigrated mcp 2.x bump merged
+  # here, built green (a Docker build never imports the app), and Flux rolled
+  # it out. The gate costs ~20s and removes that path. Mirrors hk47.
+  check:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
