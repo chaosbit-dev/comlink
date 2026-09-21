@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 # ---- Stage 2: runtime -------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 
 # Non-root runtime user (fixed UID/GID so the K8s securityContext can pin it).
 # 65532 is the conventional "nonroot" UID (matches distroless), unprivileged.
