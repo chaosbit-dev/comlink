@@ -246,3 +246,7 @@ Error classes match the design doc §8 taxonomy; every message tells the agent w
 - Design doc: `docs/design-doc.md` (architecture, Bridge constraints, security model, epics).
 - MCP spec: https://modelcontextprotocol.io
 - Proton Mail Bridge: https://proton.me/mail/bridge
+
+## License
+
+[MIT](LICENSE)
