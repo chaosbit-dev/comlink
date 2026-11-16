@@ -34,6 +34,13 @@
       "labels": [
         "needs-judgement"
       ]
+    },
+    {
+      "description": "Hold the python Docker image below 3.15 until every compiled dependency in uv.lock (cffi, pydantic-core, librt) ships a cp315 or abi3 wheel; until then a 3.15 image builds them from source. Remove this rule then. See chaosbit-dev/comlink#7.",
+      "matchPackageNames": [
+        "python"
+      ],
+      "allowedVersions": "<3.15"
     }
   ],
   "vulnerabilityAlerts": {

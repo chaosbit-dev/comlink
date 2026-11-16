@@ -51,7 +51,7 @@ jobs:
         with:
           # 3.12 to match the Dockerfile (python:3.12-slim-bookworm); building and
           # testing on different minors is how a 3.13-only failure reaches prod.
-          python-version: "3.12"
+          python-version: "3.14"
           enable-cache: true
 
       # --locked fails if uv.lock is out of sync with pyproject.toml, so a

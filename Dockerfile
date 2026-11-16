@@ -8,12 +8,11 @@
 # build --platform linux/amd64, import into k3s containerd, kubectl apply -k.
 
 # ---- Stage 1: builder -------------------------------------------------------
-# uv's official image with Python 3.12 baked in (bookworm-slim base, matching
-# stage 2's python:3.12-slim-bookworm so the resolved interpreter is identical).
-# This tag tracks the latest uv — a build tool whose exact version isn't
-# runtime-critical; pin to a specific uv release (e.g. :0.5.x-python3.12-...) if
-# you want fully reproducible builds.
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+# uv's official image with Python 3.14 baked in (bookworm-slim base, matching
+# stage 2's python:3.14-slim-bookworm so the resolved interpreter is identical).
+# uv publishes no tag combining a uv version with Python 3.14, so the digest is
+# the pin; it tracks whatever uv was current when the digest was resolved.
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim@sha256:7cf77f594be8042dab6daa9fe326f90962252268b4f120a7f5dccce4d947e6c1 AS builder
 
 # uv build-time behavior:
 #   - compile bytecode for faster cold starts
@@ -39,7 +38,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 # ---- Stage 2: runtime -------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm@sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b AS runtime
 
 # Non-root runtime user (fixed UID/GID so the K8s securityContext can pin it).
 # 65532 is the conventional "nonroot" UID (matches distroless), unprivileged.
