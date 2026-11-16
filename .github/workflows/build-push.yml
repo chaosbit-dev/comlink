@@ -46,6 +46,9 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   build:
+    # The registry and tailnet credentials live in the `release` environment, which only the default
+    # branch may use: a pushed branch's workflow can't read them (Kamino KAMINO-FLOW-BOOT-012).
+    environment: release
     needs: check
     runs-on: ubuntu-latest
     steps:
