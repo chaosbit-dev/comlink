@@ -61,7 +61,10 @@ def _self_signed(tmp: Path) -> tuple[Path, Path]:
 def _serve(srv: socket.socket, server_ctx: ssl.SSLContext) -> None:
     conn, _ = srv.accept()
     stream = conn.makefile("rwb")
-    stream.write(b"* OK [CAPABILITY IMAP4rev1 STARTTLS] stub ready\r\n")
+    # Advertise STARTTLS until TLS is up, in the greeting and in any CAPABILITY reply:
+    # the client may ask again rather than trust the greeting.
+    capabilities = b"IMAP4rev1 STARTTLS"
+    stream.write(b"* OK [CAPABILITY " + capabilities + b"] stub ready\r\n")
     stream.flush()
     while line := stream.readline():
         tag, _, rest = line.rstrip(b"\r\n").partition(b" ")
@@ -71,9 +74,10 @@ def _serve(srv: socket.socket, server_ctx: ssl.SSLContext) -> None:
             stream.flush()
             conn = server_ctx.wrap_socket(conn, server_side=True)
             stream = conn.makefile("rwb")
+            capabilities = b"IMAP4rev1"
             continue
         if command == b"CAPABILITY":
-            stream.write(b"* CAPABILITY IMAP4rev1\r\n")
+            stream.write(b"* CAPABILITY " + capabilities + b"\r\n")
         if command == b"LOGOUT":
             stream.write(b"* BYE\r\n" + tag + b" OK bye\r\n")
             stream.flush()
