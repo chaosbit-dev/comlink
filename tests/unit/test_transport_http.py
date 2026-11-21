@@ -37,12 +37,12 @@ class TestStdioDefault:
         # is now answered by whether the stdio path consults _http_app_kwargs.
         called: list[object] = []
 
-        monkeypatch.setattr(server_module, "load_settings", lambda: make_settings(
-            transport="stdio", http_host="0.0.0.0", http_port=9999
-        ))
         monkeypatch.setattr(
-            server_module, "_http_app_kwargs", lambda s: called.append(s) or {}
+            server_module,
+            "load_settings",
+            lambda: make_settings(transport="stdio", http_host="0.0.0.0", http_port=9999),
         )
+        monkeypatch.setattr(server_module, "_http_app_kwargs", lambda s: called.append(s) or {})
         monkeypatch.setattr("mcp.server.mcpserver.MCPServer.run", lambda self: None)
         monkeypatch.setattr(server_module, "_run_http", lambda server, settings: None)
 
@@ -83,9 +83,9 @@ class TestHttpAppKwargs:
         ]
 
     def test_dns_rebinding_protection_off_when_allowed_hosts_empty(self) -> None:
-        ts = _http_app_kwargs(
-            make_settings(transport="streamable-http", http_allowed_hosts="")
-        )["transport_security"]
+        ts = _http_app_kwargs(make_settings(transport="streamable-http", http_allowed_hosts=""))[
+            "transport_security"
+        ]
         assert ts.enable_dns_rebinding_protection is False
 
 
