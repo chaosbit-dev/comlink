@@ -95,6 +95,8 @@ logged. Mirrors `src/comlink/config.py`.
 | `COMLINK_SMTP_SECURITY` | `starttls` | `starttls` (connect plaintext, upgrade in-band — Bridge default) or `ssl` (implicit TLS on connect). Set to `ssl` if your Bridge's SMTP is configured for SSL/TLS. |
 | `COMLINK_USERNAME` | `""` | Bridge username (usually your Proton address) |
 | `COMLINK_PASSWORD` | _unset_ | Bridge app password (NOT the Proton account password). Prefer the command form below. |
+| `COMLINK_ACCOUNTS` | _unset_ | Split address mode: comma-separated Bridge addresses. Unset ⇒ `COMLINK_USERNAME` alone. Per-message tools then take an `address`. See design doc §5. |
+| `COMLINK_PASSWORD_DIR` | _unset_ | One password file per address, `@` → `_at_` in the filename (`kamino_at_chaosbit.dev`). A password command receives the address as `$COMLINK_ACCOUNT`. |
 | `COMLINK_PASSWORD_COMMAND` | _unset_ | Shell command whose stdout is the app password, e.g. `security find-generic-password -s proton-bridge -w` (Keychain) or `bw get password proton-bridge` (Vaultwarden). **Wins over `COMLINK_PASSWORD` if both are set.** |
 | `COMLINK_TLS_MODE` | `verify` | `verify` or `no-verify`. `no-verify` is refused for non-localhost hosts. |
 | `COMLINK_TLS_CERT_PATH` | _unset_ | Pinned Bridge certificate for `verify` mode. |
