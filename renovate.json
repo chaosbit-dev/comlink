@@ -8,13 +8,15 @@
   "timezone": "America/Chicago",
   "prConcurrentLimit": 3,
   "prHourlyLimit": 0,
+  "minimumReleaseAge": "7 days",
   "commitMessagePrefix": "chore(deps):",
   "dependencyDashboardTitle": "Renovate — outstanding dependency updates",
   "description": [
     "Renovate runs from the CENTRAL workflow in chaosbit-dev/gonk-infra (.github/workflows/renovate.yml) — there is no renovate.yml in this repo. This file says only WHAT to update here; the runner, its schedule and RENOVATE_TOKEN live there. Removing this repo from RENOVATE_REPOSITORIES in that workflow silently stops all updates here.",
     "Division of labour with sentinel: Trivy Operator scans the image this repo builds once it is RUNNING on the cluster, including base-OS CVEs. Renovate covers the source side Trivy structurally cannot see — the workflow supply chain, and base images before they ship.",
     "SCHEDULE REMOVED 2026-09-14. There is no renovate.yml in this repo — the central runner in gonk-infra is fired by a cron, and that cron IS the schedule. A second gate here let GitHub's scheduler drift silently veto every non-security update.",
-    "Evidence: the cron asks for 10:17 UTC but GitHub started it at 15:52 UTC (2026-09-07) and 16:22 UTC (2026-09-14), both outside the old '* 4-7 * * 1' window. Two weeks running, this repo's Actions digest-pinning updates were skipped with a green workflow. To change timing, change the cron in gonk-infra."
+    "Evidence: the cron asks for 10:17 UTC but GitHub started it at 15:52 UTC (2026-09-07) and 16:22 UTC (2026-09-14), both outside the old '* 4-7 * * 1' window. Two weeks running, this repo's Actions digest-pinning updates were skipped with a green workflow. To change timing, change the cron in gonk-infra.",
+    "KAMINO-DELIVER-IMG-007 (decided 2026-11-18, epic chaosbit-dev/kamino#560): minimumReleaseAge holds every non-security update until the release is 7 days old. vulnerabilityAlerts sets it back to null so [SECURITY] PRs (GitHub alerts and OSV) are never held; that is already Renovate's default for vulnerabilityAlerts, and it is written out here so the exemption is visible. Do not add minimumReleaseAge to a packageRule without the same security exemption."
   ],
   "packageRules": [
     {
@@ -49,7 +51,8 @@
     ],
     "schedule": [
       "at any time"
-    ]
+    ],
+    "minimumReleaseAge": null
   },
   "osvVulnerabilityAlerts": true
 }
