@@ -78,7 +78,9 @@ class AccountPool:
         try:
             return self.resolve(from_address)
         except ComlinkError as exc:
-            raise ComlinkError(str(exc).replace("address is required", "from_address is required", 1)) from exc
+            raise ComlinkError(
+                str(exc).replace("address is required", "from_address is required", 1)
+            ) from exc
 
     async def aclose(self) -> None:
         for manager in self._managers.values():
