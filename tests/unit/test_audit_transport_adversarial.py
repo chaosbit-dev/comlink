@@ -40,6 +40,7 @@ def fake_send(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         message: Any,
         *,
         envelope_recipients: list[str],
+        username: str | None = None,
     ) -> str:
         used.append(password)
         return str(message["Message-ID"])

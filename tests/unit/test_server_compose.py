@@ -137,6 +137,7 @@ def captured_send(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         message: EmailMessage,
         *,
         envelope_recipients: list[str],
+        username: str | None = None,
     ) -> str:
         calls.append(
             {

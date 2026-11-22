@@ -69,6 +69,17 @@ class AccountPool:
             )
         return key, manager
 
+    def resolve_sender(self, from_address: str | None) -> tuple[str, ImapConnectionManager]:
+        """The From address and its manager; refuse (never guess) when ambiguous.
+
+        Same rule as :meth:`resolve`, worded for a sender: with one address configured
+        ``from_address`` is optional; with several, a missing or unknown one is refused.
+        """
+        try:
+            return self.resolve(from_address)
+        except ComlinkError as exc:
+            raise ComlinkError(str(exc).replace("address is required", "from_address is required", 1)) from exc
+
     async def aclose(self) -> None:
         for manager in self._managers.values():
             await manager.aclose()
