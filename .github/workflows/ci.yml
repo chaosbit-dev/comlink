@@ -15,7 +15,7 @@
 #
 # Mirrors homeassistant-mcp/.github/workflows/ci.yml and the CLAUDE.md dev loop:
 #     uv run ruff check .
-#     uv run mypy src
+#     uv run mypy .
 #     uv run pytest -q
 #
 # No secrets and no tailnet access: everything runs against the checkout, so this
@@ -70,7 +70,7 @@ jobs:
 
       - name: Type-check (mypy --strict)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: uv run mypy src
+        run: uv run mypy .
 
       - name: Tests (pytest)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}

@@ -84,9 +84,9 @@ class ComlinkSettings(BaseSettings):
 
     read_only: bool = False
 
-    # Resolved credentials kept for error redaction only (None = could not resolve), so
-    # redacting an error never re-runs a password command on the event loop.
-    _redaction_secrets: dict[str, str | None] = PrivateAttr(default_factory=dict)
+    # Latest successfully resolved credential per address, kept for error redaction only,
+    # so redacting an error never re-runs a password command on the event loop.
+    _redaction_secrets: dict[str, str] = PrivateAttr(default_factory=dict)
 
     allow_send: bool = False
     send_allowlist: str = ""
@@ -257,6 +257,14 @@ class ComlinkSettings(BaseSettings):
         ``COMLINK_PASSWORD_DIR``, then ``COMLINK_PASSWORD`` (one address only).
         """
         address = address if address is not None else self.username
+        password = self._lookup_password(address)
+        # Collected for error redaction as each credential is resolved (a manager's
+        # login, including its re-login after a rotation), so redaction never runs the
+        # password command itself and always holds the latest value.
+        self._redaction_secrets[normalize_address(address)] = password
+        return password
+
+    def _lookup_password(self, address: str) -> str:
         if self.password_command:
             try:
                 # Shell execution is intentional: the command is operator-supplied
@@ -328,16 +336,12 @@ class ComlinkSettings(BaseSettings):
         return password
 
     def redaction_password(self, address: str) -> str | None:
-        """*address*'s resolved password for redaction, resolved at most once.
+        """*address*'s most recently resolved password, for redaction.
 
-        Best-effort: ``None`` when it cannot be resolved (that failure is cached too).
+        Best-effort and side-effect free: ``None`` until a resolution has succeeded
+        (a failed resolution is never recorded), and it follows later resolutions.
         """
-        if address not in self._redaction_secrets:
-            try:
-                self._redaction_secrets[address] = self.resolve_password(address)
-            except Exception:  # redaction must never raise on resolution failure
-                self._redaction_secrets[address] = None
-        return self._redaction_secrets[address]
+        return self._redaction_secrets.get(normalize_address(address))
 
     def _raw_password(self) -> str | None:
         return self.password.get_secret_value() if self.password is not None else None

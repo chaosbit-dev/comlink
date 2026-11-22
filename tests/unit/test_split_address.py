@@ -100,11 +100,16 @@ class TestCredentials:
     def test_redaction_covers_every_address(self, tmp_path: Path) -> None:
         for i, addr in enumerate(ADDRS):
             (tmp_path / password_filename(addr)).write_text(f"secret-{i}")
-        secrets = [x for x in _raw_secrets(multi_settings(password_dir=tmp_path)) if x]
+        s = multi_settings(password_dir=tmp_path)
+        for addr in ADDRS:
+            s.resolve_password(addr)
+        secrets = [x for x in _raw_secrets(s) if x]
         assert {"secret-0", "secret-1", "secret-2"} <= set(secrets)
 
     def test_redaction_covers_every_address_via_command(self) -> None:
         s = multi_settings(password_command='printf "cmd-%s" "$COMLINK_ACCOUNT"')
+        for addr in ADDRS:
+            s.resolve_password(addr)
         secrets = _raw_secrets(s)
         assert all(f"cmd-{a}" in secrets for a in ADDRS)
 
@@ -154,7 +159,7 @@ class TestPool:
         }
 
     async def test_each_address_logs_in_as_itself(
-        self, bridge: FakeBridgeState, tmp_path: Path
+        self, bridge: FakeBridgeState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         logins: list[tuple[str, str]] = []
         original = bridge.clients  # noqa: F841 - keep fixture patched
@@ -163,7 +168,7 @@ class TestPool:
         pool = AccountPool(multi_settings(password_dir=tmp_path))
         import comlink.bridge.imap as imap_module
 
-        base = imap_module.IMAPClient
+        base: Any = getattr(imap_module, "IMAPClient")  # noqa: B009
 
         def spy_factory(*args: Any, **kwargs: Any) -> Any:
             client = base(*args, **kwargs)
@@ -176,12 +181,9 @@ class TestPool:
             client.login = login
             return client
 
-        imap_module.IMAPClient = spy_factory  # type: ignore[assignment]
-        try:
-            for _addr, manager in pool.items():
-                await manager.verify_connectivity()
-        finally:
-            imap_module.IMAPClient = base  # type: ignore[assignment]
+        monkeypatch.setattr(imap_module, "IMAPClient", spy_factory)
+        for _addr, manager in pool.items():
+            await manager.verify_connectivity()
         assert logins == [(a, f"pw-{a}") for a in ADDRS]
 
 
@@ -255,7 +257,7 @@ class TestFanOut:
     async def test_search_cap_and_pagination(self) -> None:
         many = [(i, day(1 + i % 28)) for i in range(1, 201)]
         settings, pool = fake_pool({ADDRS[0]: FakeManager(many), ADDRS[1]: FakeManager(many)})
-        pages = []
+        pages: list[Any] = []
         offset = 0
         while True:
             out = await search_messages_fanout_impl(
@@ -279,7 +281,7 @@ class TestFanOut:
         a = [(i, day(1 + i % 20)) for i in range(1, 31)]
         b = [(i, day(1 + i % 20)) for i in range(1, 31)]
         settings, pool = fake_pool({ADDRS[0]: FakeManager(a), ADDRS[1]: FakeManager(b)})
-        seen = []
+        seen: list[tuple[str, int]] = []
         for offset in (0, 25, 50):
             out = await list_messages_fanout_impl(settings, pool, limit=25, offset=offset)
             assert out["total"] == 60
@@ -296,7 +298,7 @@ class TestFanOut:
         settings, pool = fake_pool(
             {ADDRS[0]: FakeManager(forged()), ADDRS[1]: FakeManager(forged())}
         )
-        seen = []
+        seen: list[tuple[str, int]] = []
         for offset in range(0, 80, 10):
             out = await list_messages_fanout_impl(settings, pool, limit=10, offset=offset)
             seen.extend((m["address"], m["uid"]) for m in out["messages"])
@@ -325,6 +327,8 @@ class TestFanOut:
         }
         settings = multi_settings(accounts=",".join(managers), password_dir=tmp_path)
         pool = AccountPool(settings, managers=managers)  # type: ignore[arg-type]
+        for addr in managers:
+            settings.resolve_password(addr)  # as each manager's login does
         out = await search_messages_fanout_impl(settings, pool, query="x")
         text = json.dumps(out)
         assert "hunter2-secret" not in text and "other-secret" not in text
@@ -341,7 +345,7 @@ class TestFanOut:
             settings,
             pool.primary,
             RateLimiter(),
-            pool=pool,  # type: ignore[arg-type]
+            pool=pool,
         )
         by_addr = {a["address"]: a for a in report["accounts"]}
         assert by_addr[ADDRS[0]]["imap"]["ok"] is False
@@ -351,8 +355,9 @@ class TestFanOut:
 
     async def test_health_single_address_has_no_accounts_section(self) -> None:
         settings = make_settings(read_only=True)
-        pool = AccountPool(settings, managers={"tester@example.com": FakeManager([])})  # type: ignore[arg-type]
-        report = await health_check_impl(settings, pool.primary, RateLimiter(), pool=pool)  # type: ignore[arg-type]
+        managers: dict[str, Any] = {"tester@example.com": FakeManager([])}
+        pool = AccountPool(settings, managers=managers)
+        report = await health_check_impl(settings, pool.primary, RateLimiter(), pool=pool)
         assert "accounts" not in report
 
 
@@ -361,7 +366,7 @@ class TestToolSurface:
         from comlink.server import create_server
 
         server = create_server(multi_settings())
-        for name, args in [
+        cases: list[tuple[str, dict[str, Any]]] = [
             ("proton_get_message", {"uid": 1, "folder": "INBOX"}),
             ("proton_list_folders", {}),
             ("proton_mark_messages", {"uids": [1], "folder": "INBOX", "mark": "read"}),
@@ -371,7 +376,8 @@ class TestToolSurface:
                 {"uids": [1], "source_folder": "a", "destination_folder": "b"},
             ),
             ("proton_create_folder", {"name": "x"}),
-        ]:
+        ]
+        for name, args in cases:
             # The SDK wraps tool exceptions; the cause is Comlink's refusal.
             with pytest.raises(Exception) as excinfo:
                 await server.call_tool(name, args)
@@ -392,12 +398,57 @@ class TestReviewRound1:
         with pytest.raises(ValidationError, match="plain address"):
             make_settings(username="../secret", password=None, password_dir=tmp_path)
 
-    def test_redaction_resolves_command_once(self, tmp_path: Path) -> None:
+    def test_redaction_never_runs_the_command(self, tmp_path: Path) -> None:
         counter = tmp_path / "n"
         s = multi_settings(password_command=f'echo x >> {counter}; printf "pw-$COMLINK_ACCOUNT"')
         _raw_secrets(s)
         _raw_secrets(s)
-        assert len(counter.read_text().splitlines()) == len(ADDRS)
+        assert not counter.exists()
+
+    def test_failed_resolution_is_not_cached(self, tmp_path: Path) -> None:
+        addr = ADDRS[1]
+        s = multi_settings(password_dir=tmp_path)
+        with pytest.raises(ConfigError):
+            s.resolve_password(addr)
+        assert s.redaction_password(addr) is None
+        (tmp_path / password_filename(addr)).write_text("late-pw")
+        assert s.resolve_password(addr) == "late-pw"
+        assert s.redaction_password(addr) == "late-pw"
+
+    async def test_redaction_refreshes_after_relogin(
+        self, bridge: FakeBridgeState, tmp_path: Path
+    ) -> None:
+        addr = ADDRS[1]
+        file = tmp_path / password_filename(addr)
+        file.write_text("pw-old")
+        s = multi_settings(password_dir=tmp_path)
+        manager = AccountPool(s).resolve(addr)[1]
+        await manager.verify_connectivity()
+        assert s.redaction_password(addr) == "pw-old"
+        file.write_text("pw-new")
+        await manager.aclose()  # drop the connection: the next call logs in again
+        await manager.verify_connectivity()
+        assert s.redaction_password(addr) == "pw-new"
+        assert "pw-new" in _raw_secrets(s)
+
+    async def test_delete_resolves_address_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from comlink.server import create_server
+
+        pool_resolve = AccountPool.resolve
+        calls: list[str | None] = []
+
+        def counting(self: AccountPool, address: str | None) -> Any:
+            calls.append(address)
+            return pool_resolve(self, address)
+
+        monkeypatch.setattr(AccountPool, "resolve", counting)
+        server = create_server(multi_settings())
+        with pytest.raises(Exception):  # noqa: B017 - no Bridge; only the resolve count matters
+            await server.call_tool(
+                "proton_delete_messages",
+                {"uids": [1], "folder": "INBOX", "address": ADDRS[1]},
+            )
+        assert calls == [ADDRS[1]]
 
     def test_delete_audit_entry_address_only_when_given(self) -> None:
         from comlink.guardrails import delete_audit_entry

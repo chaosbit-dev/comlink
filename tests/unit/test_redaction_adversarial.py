@@ -72,6 +72,7 @@ class TestCommandDerivedRedactionSet:
             password=None,
             password_command=f"printf %s {secret}; printf noise 1>&2",
         )
+        settings.resolve_password()
         secrets = [s for s in _raw_secrets(settings) if s]
         assert secret in secrets
 
@@ -97,6 +98,7 @@ class TestCommandDerivedRedactionSet:
             password_command=f"printf %s {secret}",
         )
         exc = RuntimeError(f"bridge said: bad creds {secret}")
+        settings.resolve_password()
         out = redacted_message(exc, _raw_secrets(settings))
         assert secret not in out
         assert REDACTED in out
@@ -112,6 +114,7 @@ def test_both_static_and_command_secrets_scrubbed_together() -> None:
         password=static_pw,
         password_command=f"printf %s {cmd_secret}",
     )
+    settings.resolve_password()
     text = f"leak {static_pw} and {cmd_secret} both"
     out = redact(text, _raw_secrets(settings))
     assert static_pw not in out
