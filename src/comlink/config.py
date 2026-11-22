@@ -91,6 +91,10 @@ class ComlinkSettings(BaseSettings):
     allow_send: bool = False
     send_allowlist: str = ""
     send_max_per_hour: int = 5
+    # Addresses (subset of COMLINK_ACCOUNTS) that can never be sent from
+    # (COMLINK_NO_SEND_ADDRESSES). The send gate above is global; this only makes
+    # individual addresses read-only.
+    no_send_addresses: str = ""
     audit_log: Path = Path("~/.comlink/audit.jsonl")
 
     transport: Literal["stdio", "streamable-http"] = "stdio"
@@ -165,6 +169,12 @@ class ComlinkSettings(BaseSettings):
                 )
         else:
             self.username = addresses[0]
+        unknown = [a for a in self.parsed_no_send_addresses() if a not in addresses]
+        if unknown:
+            raise ValueError(
+                f"COMLINK_NO_SEND_ADDRESSES lists {', '.join(unknown)}, which is not in "
+                "COMLINK_ACCOUNTS."
+            )
         if len(addresses) > 1 and self.password is not None:
             raise ValueError(
                 "COMLINK_PASSWORD cannot serve several addresses. Supply one credential "
@@ -349,6 +359,14 @@ class ComlinkSettings(BaseSettings):
     def parsed_allowlist(self) -> list[str]:
         """Comma-separated allowlist → normalized list (lowercased, blanks dropped)."""
         return [item.strip().lower() for item in self.send_allowlist.split(",") if item.strip()]
+
+    def parsed_no_send_addresses(self) -> list[str]:
+        """Comma-separated read-only (``send: false``) addresses, normalized."""
+        return [normalize_address(a) for a in self.no_send_addresses.split(",") if a.strip()]
+
+    def send_allowed_from(self, address: str) -> bool:
+        """Whether *address* may send (the global gate is checked separately)."""
+        return normalize_address(address) not in self.parsed_no_send_addresses()
 
     def parsed_http_allowed_hosts(self) -> list[str]:
         """Comma-separated Host allowlist → list (stripped, blanks dropped).

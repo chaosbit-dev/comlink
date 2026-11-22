@@ -21,6 +21,9 @@ class AccountPool:
         settings: ComlinkSettings,
         managers: dict[str, ImapConnectionManager] | None = None,
     ) -> None:
+        # Legacy single-address mode keeps COMLINK_USERNAME's exact spelling for the
+        # From header and SMTP login; keys and comparisons are normalized.
+        self._spelling: dict[str, str] = {}
         if managers is not None:
             self._managers = dict(managers)
         elif settings.accounts.strip():
@@ -31,6 +34,7 @@ class AccountPool:
         else:
             # Legacy single-address deployment: log in exactly as COMLINK_USERNAME says.
             self._managers = {normalize_address(settings.username): ImapConnectionManager(settings)}
+            self._spelling[normalize_address(settings.username)] = settings.username
         self._primary = normalize_address(settings.username) if settings.username else ""
         if self._primary not in self._managers:
             self._primary = next(iter(self._managers))
@@ -46,7 +50,7 @@ class AccountPool:
 
     @property
     def primary(self) -> ImapConnectionManager:
-        """The default account's manager (drafts and send stay on it; see design doc)."""
+        """The default account's manager (the default when one address is configured)."""
         return self._managers[self._primary]
 
     def items(self) -> list[tuple[str, ImapConnectionManager]]:
@@ -68,6 +72,32 @@ class AccountPool:
                 f"Unknown address {address!r}. Configured addresses: {', '.join(self._managers)}."
             )
         return key, manager
+
+    def resolve_sender(self, from_address: str | None) -> tuple[str, ImapConnectionManager]:
+        """The From address and its manager; refuse (never guess) when ambiguous.
+
+        Same rule as :meth:`resolve`, worded for a sender: with one address configured
+        ``from_address`` is optional; with several, a missing or unknown one is refused.
+        """
+        try:
+            key, manager = self.resolve(from_address)
+        except ComlinkError as exc:
+            message = str(exc).replace("address is required", "from_address is required", 1)
+            raise ComlinkError(message) from exc
+        return self._spelling.get(key, key), manager
+
+    def resolve_reply_parent(
+        self, sender: str, sender_manager: ImapConnectionManager, in_reply_to_address: str | None
+    ) -> ImapConnectionManager:
+        """The mailbox a reply's parent UID lives in (default: the From address's).
+
+        A UID is only meaningful within one address's mailbox, so a reply to a message
+        in another address's mailbox must name that address explicitly; an unconfigured
+        one is refused.
+        """
+        if in_reply_to_address is None or not in_reply_to_address.strip():
+            return sender_manager
+        return self.resolve(in_reply_to_address)[1]
 
     async def aclose(self) -> None:
         for manager in self._managers.values():

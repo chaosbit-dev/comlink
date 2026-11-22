@@ -73,7 +73,11 @@ def delete_audit_entry(
 
 
 def send_audit_entry(
-    recipients: list[str], subject: str, message_id: str, transport: str = DEFAULT_TRANSPORT
+    recipients: list[str],
+    subject: str,
+    message_id: str,
+    transport: str = DEFAULT_TRANSPORT,
+    from_address: str | None = None,
 ) -> dict[str, Any]:
     """Build the send audit entry. No body, no password, no secrets (§7.4).
 
@@ -84,7 +88,7 @@ def send_audit_entry(
     (the Access email/subject under streamable-http; ``None`` under stdio/local). The
     principal is a non-secret identifier — safe to log, unlike the body or password.
     """
-    return {
+    entry: dict[str, Any] = {
         "ts": audit_timestamp(),
         "action": "send",
         "transport": transport,
@@ -93,6 +97,9 @@ def send_audit_entry(
         "subject": subject,
         "message_id": message_id,
     }
+    if from_address is not None:
+        entry["from_address"] = from_address
+    return entry
 
 
 # ---------------------------------------------------------------------------

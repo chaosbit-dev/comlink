@@ -43,7 +43,7 @@ def _build_client(settings: ComlinkSettings, timeout: int) -> aiosmtplib.SMTP:
 
 
 async def _connect_and_login(
-    client: aiosmtplib.SMTP, settings: ComlinkSettings, password: str
+    client: aiosmtplib.SMTP, settings: ComlinkSettings, password: str, username: str | None = None
 ) -> None:
     """Connect, upgrade to TLS if STARTTLS mode, and authenticate.
 
@@ -54,7 +54,7 @@ async def _connect_and_login(
     await client.connect()
     if settings.smtp_security == "starttls":
         await client.starttls(tls_context=settings.build_ssl_context())
-    await client.login(settings.username, password)
+    await client.login(username if username is not None else settings.username, password)
 
 
 async def verify_smtp_connectivity(settings: ComlinkSettings, password: str) -> None:
@@ -84,6 +84,7 @@ async def send_message(
     message: EmailMessage,
     *,
     envelope_recipients: list[str],
+    username: str | None = None,
 ) -> str:
     """Send *message* via the Bridge SMTP endpoint; return its Message-ID.
 
@@ -91,13 +92,14 @@ async def send_message(
     The SMTP envelope recipients (``to`` + ``cc`` + ``bcc``) are passed
     explicitly so Bcc recipients receive the message without a Bcc header ever
     being serialized (§6). Never APPENDs to Sent — Proton saves the Sent copy
-    server-side (§3.6).
+    server-side (§3.6). *username* is the address to authenticate as (split mode:
+    the From address, with its own *password*); default ``COMLINK_USERNAME``.
     """
     from_addr = str(message["From"])
     message_id = str(message["Message-ID"])
     client = _build_client(settings, timeout=30)
     try:
-        await _connect_and_login(client, settings, password)
+        await _connect_and_login(client, settings, password, username)
         await client.send_message(message, sender=from_addr, recipients=envelope_recipients)
     except aiosmtplib.SMTPAuthenticationError as exc:
         raise AuthFailed.smtp() from exc

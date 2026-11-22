@@ -718,10 +718,41 @@ async def _build_outgoing(
     )
 
 
+def _sender(
+    settings: ComlinkSettings,
+    imap: ImapConnectionManager,
+    pool: AccountPool | None,
+    from_address: str | None,
+    in_reply_to_address: str | None,
+    in_reply_to_uid: int | None,
+) -> tuple[str, ImapConnectionManager, ImapConnectionManager]:
+    """The From address, its mailbox (drafts) and the reply parent's mailbox.
+
+    The parent UID is looked up in ``in_reply_to_address``'s mailbox (default: the From
+    address's); UIDs are per mailbox, so the two can differ.
+    """
+    if in_reply_to_address is not None and in_reply_to_uid is None:
+        raise ComlinkError(
+            "in_reply_to_address only applies to a reply: pass in_reply_to_uid and "
+            "in_reply_to_folder too, or omit it."
+        )
+    if pool is None:
+        if from_address is not None or in_reply_to_address is not None:
+            raise ComlinkError(
+                "from_address and in_reply_to_address need the configured address pool."
+            )
+        return settings.username, imap, imap
+    sender, manager = pool.resolve_sender(from_address)
+    return sender, manager, pool.resolve_reply_parent(sender, manager, in_reply_to_address)
+
+
 async def save_draft_impl(
     settings: ComlinkSettings,
     imap: ImapConnectionManager,
     *,
+    pool: AccountPool | None = None,
+    from_address: str | None = None,
+    in_reply_to_address: str | None = None,
     to: list[str] | None = None,
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
@@ -730,13 +761,16 @@ async def save_draft_impl(
     in_reply_to_uid: int | None = None,
     in_reply_to_folder: str | None = None,
 ) -> dict[str, Any]:
-    """Build an RFC 5322 message and APPEND it to Drafts (the default compose path)."""
+    """Build an RFC 5322 message and APPEND it to the From address's Drafts."""
+    sender, imap, parent_imap = _sender(
+        settings, imap, pool, from_address, in_reply_to_address, in_reply_to_uid
+    )
     to, cc, bcc = list(to or []), list(cc or []), list(bcc or [])
     _validate_reply_params(in_reply_to_uid, in_reply_to_folder)
     _require_recipients(to, cc, bcc)
     message = await _build_outgoing(
-        imap,
-        from_addr=settings.username,
+        parent_imap,
+        from_addr=sender,
         to=to,
         cc=cc,
         bcc=bcc,
@@ -764,6 +798,9 @@ async def send_message_impl(
     imap: ImapConnectionManager,
     rate_limiter: RateLimiter,
     *,
+    pool: AccountPool | None = None,
+    from_address: str | None = None,
+    in_reply_to_address: str | None = None,
     to: list[str] | None = None,
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
@@ -773,14 +810,22 @@ async def send_message_impl(
     in_reply_to_uid: int | None = None,
     in_reply_to_folder: str | None = None,
 ) -> dict[str, Any]:
-    """Gated send pipeline (§7): confirm → allowlist → rate-limit → SMTP send →
-    commit budget → audit. NEVER APPENDs to Sent (§3.6).
+    """Gated send pipeline (§7): confirm → From address (known, send-enabled) →
+    allowlist → rate-limit → SMTP send → commit budget → audit. NEVER APPENDs to Sent (§3.6).
     """
     # Layer-1 (env gate) is enforced at registration; here we enforce the
     # schema-required confirm at runtime as a belt-and-braces guard (Echo intel:
     # `is not True` so a non-bool truthy value can't slip past).
     if confirm is not True:
         raise SendBlocked.confirm_not_asserted()
+    # From address (split mode): refused when missing/unknown with several configured,
+    # and when the address is marked read-only. The gate below is global, shared by
+    # every From address.
+    sender, _imap, parent_imap = _sender(
+        settings, imap, pool, from_address, in_reply_to_address, in_reply_to_uid
+    )
+    if not settings.send_allowed_from(sender):
+        raise SendBlocked.address_read_only(sender)
     to, cc, bcc = list(to or []), list(cc or []), list(bcc or [])
     _validate_reply_params(in_reply_to_uid, in_reply_to_folder)
     _require_recipients(to, cc, bcc)
@@ -795,8 +840,8 @@ async def send_message_impl(
     rate_limiter.reserve(now, settings.send_max_per_hour)
     try:
         message = await _build_outgoing(
-            imap,
-            from_addr=settings.username,
+            parent_imap,
+            from_addr=sender,
             to=to,
             cc=cc,
             bcc=bcc,
@@ -805,9 +850,13 @@ async def send_message_impl(
             in_reply_to_uid=in_reply_to_uid,
             in_reply_to_folder=in_reply_to_folder,
         )
-        password = settings.resolve_password()
+        password = settings.resolve_password(sender)
         message_id = await smtp.send_message(
-            settings, password, message, envelope_recipients=envelope_recipients
+            settings,
+            password,
+            message,
+            envelope_recipients=envelope_recipients,
+            username=sender,
         )
     except BaseException:
         # Includes asyncio.CancelledError — a cancelled send must not hold a slot.
@@ -820,6 +869,7 @@ async def send_message_impl(
             str(message["Subject"]),
             message_id,
             transport=settings.transport,
+            from_address=sender,
         ),
     )
     return SendResult(message_id=message_id, recipients=envelope_recipients).model_dump()
@@ -890,7 +940,6 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
         ),
     )
     pool = AccountPool(settings)
-    # Drafts and send stay on the default account (send from any address: comlink#14).
     imap = pool.primary
     # One process-lifetime rate limiter shared by the send tool and the health
     # check (§7.1). A per-call limiter would silently disable the limit.
@@ -1174,6 +1223,8 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
 
         @mcp.tool()
         async def proton_save_draft(
+            from_address: str | None = None,
+            in_reply_to_address: str | None = None,
             to: list[str] | None = None,
             cc: list[str] | None = None,
             bcc: list[str] | None = None,
@@ -1189,13 +1240,21 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             Provide at least one recipient (to/cc/bcc). To reply to an existing
             message, pass BOTH in_reply_to_uid and in_reply_to_folder (from
             proton_list_messages / proton_search_messages) — In-Reply-To/References
-            and a single 'Re:' subject are set for you. Returns the new draft's UID
-            and Message-ID.
+            and a single 'Re:' subject are set for you. `from_address` is the
+            configured address the draft is From and saved under (required when
+            several are configured; a reply is saved under the replying address).
+            A UID is only valid in its own address's mailbox: `in_reply_to_address`
+            names the address whose mailbox holds the parent message (default: the
+            From address); it must be a configured address.
+            Returns the new draft's UID and Message-ID.
             """
             return _dump(
                 await save_draft_impl(
                     settings,
                     imap,
+                    pool=pool,
+                    from_address=from_address,
+                    in_reply_to_address=in_reply_to_address,
                     to=to,
                     cc=cc,
                     bcc=bcc,
@@ -1215,6 +1274,8 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             @mcp.tool(annotations=_DESTRUCTIVE)
             async def proton_send_message(
                 confirm: bool,
+                from_address: str | None = None,
+                in_reply_to_address: str | None = None,
                 to: list[str] | None = None,
                 cc: list[str] | None = None,
                 bcc: list[str] | None = None,
@@ -1230,13 +1291,22 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
                 approved THIS exact outbound message. Recipients must pass the
                 configured allowlist and the hourly rate limit. To reply, pass BOTH
                 in_reply_to_uid and in_reply_to_folder. Proton saves the Sent copy
-                server-side. Returns the sent Message-ID and recipients.
+                server-side. `from_address` is the configured address to send as
+                (required when several are configured, including for a reply; the
+                send gate is shared by all addresses). A UID is only valid in its
+                own address's mailbox: `in_reply_to_address` names the address whose
+                mailbox holds the parent message (default: the From address; it must
+                be a configured address). Returns the sent Message-ID
+                and recipients.
                 """
                 return _dump(
                     await send_message_impl(
                         settings,
                         imap,
                         rate_limiter,
+                        pool=pool,
+                        from_address=from_address,
+                        in_reply_to_address=in_reply_to_address,
                         to=to,
                         cc=cc,
                         bcc=bcc,

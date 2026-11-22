@@ -150,6 +150,7 @@ class TestAuditNoBodyNoSecret:
             message: Any,
             *,
             envelope_recipients: list[str],
+            username: str | None = None,
         ) -> str:
             captured.append(password)
             return str(message["Message-ID"])

@@ -106,6 +106,13 @@ class SendBlocked(ComlinkError):
         )
 
     @classmethod
+    def address_read_only(cls, address: str) -> SendBlocked:
+        return cls(
+            f"Send blocked: {address} is read-only (listed in COMLINK_NO_SEND_ADDRESSES). "
+            "Send from another configured address, or save a draft instead."
+        )
+
+    @classmethod
     def confirm_not_asserted(cls) -> SendBlocked:
         return cls(
             "Send blocked: confirm must be set to true to send. proton_send_message will "

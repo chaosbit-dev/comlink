@@ -22,6 +22,9 @@ from comlink.guardrails import RateLimiter
 from comlink.server import send_message_impl
 
 from ..conftest import make_settings
+from .from_variants import from_variant_fixture
+
+_from_variant = from_variant_fixture()
 
 
 class TestRateLimiterBoundary:
@@ -79,6 +82,7 @@ def send_outcome(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         message: Any,
         *,
         envelope_recipients: list[str],
+        username: str | None = None,
     ) -> str:
         state["calls"] += 1
         if state["fail"]:
@@ -229,6 +233,7 @@ class TestRateLimitConcurrency:
             message: Any,
             *,
             envelope_recipients: list[str],
+            username: str | None = None,
         ) -> str:
             calls["n"] += 1
             # Yield control so a second in-flight send interleaves here — exactly
