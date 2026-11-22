@@ -378,6 +378,16 @@ async def on_account(
     address the output is byte-for-byte what it was before split mode.
     """
     resolved, imap = pool.resolve(address)
+    return await on_resolved(pool, resolved, imap, op)
+
+
+async def on_resolved(
+    pool: AccountPool,
+    resolved: str,
+    imap: ImapConnectionManager,
+    op: Callable[[ImapConnectionManager], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    """:func:`on_account` for a caller that already ran ``pool.resolve``."""
     payload = await op(imap)
     if pool.multi:
         payload["address"] = resolved
@@ -1123,11 +1133,12 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             Trash or Spam is refused — empty those from a Proton client. Every delete
             is recorded in the audit log. Returns per-UID success/failure.
             """
-            resolved, _manager = pool.resolve(address)
+            resolved, imap = pool.resolve(address)
             return _dump(
-                await on_account(
+                await on_resolved(
                     pool,
-                    address,
+                    resolved,
+                    imap,
                     lambda manager: delete_messages_impl(
                         settings,
                         manager,

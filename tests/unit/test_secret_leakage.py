@@ -90,6 +90,7 @@ class TestPasswordRedaction:
             password=None,
             password_command=f"printf %s {_CMD_SECRET}",
         )
+        settings.resolve_password()
         assert _CMD_SECRET in [s for s in _raw_secrets(settings) if s]
 
     async def test_command_secret_redacted_in_health_error(
@@ -111,6 +112,7 @@ class TestPasswordRedaction:
             password=None,
             password_command=f"printf %s {_CMD_SECRET}",
         )
+        settings.resolve_password()  # as the IMAP manager's login does
         report = await health_check_impl(settings, _LeakyImap(), RateLimiter())  # type: ignore[arg-type]
         error_text = report["imap"]["error"]
         assert _CMD_SECRET not in error_text

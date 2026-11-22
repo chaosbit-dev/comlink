@@ -201,8 +201,9 @@ class ImapConnectionManager:
                 "COMLINK_USERNAME is not set. Set it to the Bridge username shown in "
                 "Bridge → Mailbox details."
             )
-        if self._password is None:
-            self._password = settings.resolve_password(self._address)
+        # Resolved on every (re)login so a Bridge re-auth that rotated the password is
+        # picked up, and the redaction set follows it.
+        self._password = settings.resolve_password(self._address)
         try:
             client = IMAPClient(settings.imap_host, port=settings.imap_port, ssl=False, timeout=15)
         except OSError as exc:

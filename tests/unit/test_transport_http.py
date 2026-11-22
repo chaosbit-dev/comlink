@@ -42,7 +42,12 @@ class TestStdioDefault:
             "load_settings",
             lambda: make_settings(transport="stdio", http_host="0.0.0.0", http_port=9999),
         )
-        monkeypatch.setattr(server_module, "_http_app_kwargs", lambda s: called.append(s) or {})
+
+        def record_kwargs(s: object) -> dict[str, Any]:
+            called.append(s)
+            return {}
+
+        monkeypatch.setattr(server_module, "_http_app_kwargs", record_kwargs)
         monkeypatch.setattr("mcp.server.mcpserver.MCPServer.run", lambda self: None)
         monkeypatch.setattr(server_module, "_run_http", lambda server, settings: None)
 

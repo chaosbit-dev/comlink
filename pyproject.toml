@@ -67,6 +67,8 @@ ignore = ["N818"]
 strict = true
 python_version = "3.12"
 mypy_path = "src"
+# Throwaway auth probes, not shipped code.
+exclude = ["^experiments/"]
 
 [[tool.mypy.overrides]]
 module = "imapclient.*"
