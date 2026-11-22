@@ -5,12 +5,14 @@ All settings use the ``COMLINK_`` prefix. No secrets are ever logged.
 
 from __future__ import annotations
 
+import os
+import re
 import ssl
 import subprocess
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from comlink.errors import ConfigError, redact
@@ -18,6 +20,30 @@ from comlink.errors import ConfigError, redact
 LOCALHOST_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 _PASSWORD_COMMAND_TIMEOUT_SECONDS = 30.0
+
+# Environment variable through which the account address reaches a password command.
+# The address is NEVER substituted into the shell string (design doc §5).
+ACCOUNT_ENV_VAR = "COMLINK_ACCOUNT"
+
+# A configured address: lowercase letters, digits, ``.``, ``_``, ``-``, one ``@``. This
+# is deliberately narrower than RFC 5322 so an address is always safe as a filename
+# and can never carry shell metacharacters, whitespace or path separators.
+_ADDRESS_RE = re.compile(r"^[a-z0-9._-]+@[a-z0-9.-]+$")
+
+
+def normalize_address(address: str) -> str:
+    """Canonical form of an address (stripped, lowercased)."""
+    return address.strip().lower()
+
+
+def password_filename(address: str) -> str:
+    """Filename holding *address*'s password inside ``COMLINK_PASSWORD_DIR``.
+
+    Kubernetes Secret keys allow only ``[-._a-zA-Z0-9]``, so ``@`` maps to ``_at_``:
+    ``kamino@chaosbit.dev`` → ``kamino_at_chaosbit.dev``. Domains cannot contain ``_``,
+    so the mapping is collision-free.
+    """
+    return normalize_address(address).replace("@", "_at_")
 
 
 class ComlinkSettings(BaseSettings):
@@ -33,6 +59,11 @@ class ComlinkSettings(BaseSettings):
     username: str = ""
     password: SecretStr | None = None
     password_command: str | None = None
+    # Split-address mode: comma-separated, explicit list of Bridge addresses
+    # (COMLINK_ACCOUNTS). Unset ⇒ COMLINK_USERNAME is a one-entry list.
+    accounts: str = ""
+    # Directory with one password file per address, named by password_filename().
+    password_dir: Path | None = None
 
     # DESIGN-GAP: design doc §3.4/§5 enumerate only "verify" | "no-verify". Epic 5
     # (durable K3s deploy, design doc line 246 "revisit TLS pinning against the Gonk
@@ -52,6 +83,10 @@ class ComlinkSettings(BaseSettings):
     )
 
     read_only: bool = False
+
+    # Resolved credentials kept for error redaction only (None = could not resolve), so
+    # redacting an error never re-runs a password command on the event loop.
+    _redaction_secrets: dict[str, str | None] = PrivateAttr(default_factory=dict)
 
     allow_send: bool = False
     send_allowlist: str = ""
@@ -88,6 +123,54 @@ class ComlinkSettings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _validate_password_dir_username(self) -> ComlinkSettings:
+        """The username names a file in ``COMLINK_PASSWORD_DIR``; keep it a plain address."""
+        if (
+            self.password_dir is not None
+            and not self.accounts.strip()
+            and not _ADDRESS_RE.match(normalize_address(self.username))
+        ):
+            raise ValueError(
+                "COMLINK_PASSWORD_DIR requires COMLINK_USERNAME (or COMLINK_ACCOUNTS) to "
+                "be a plain address such as brandon@chaosbit.dev."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_accounts(self) -> ComlinkSettings:
+        """Refuse a malformed, duplicated or inconsistent address list."""
+        if not self.accounts.strip():
+            return self
+        listed = [item.strip() for item in self.accounts.split(",")]
+        seen: set[str] = set()
+        for raw in listed:
+            address = normalize_address(raw)
+            if not address or not _ADDRESS_RE.match(address):
+                raise ValueError(
+                    f"COMLINK_ACCOUNTS entry {raw!r} is not a valid address. Use a "
+                    "comma-separated list of plain addresses such as "
+                    "brandon@chaosbit.dev,kamino@chaosbit.dev."
+                )
+            if address in seen:
+                raise ValueError(f"COMLINK_ACCOUNTS lists {address} more than once.")
+            seen.add(address)
+        addresses = self.account_addresses()
+        if self.username:
+            if normalize_address(self.username) not in addresses:
+                raise ValueError(
+                    "COMLINK_USERNAME is not in COMLINK_ACCOUNTS. When COMLINK_ACCOUNTS is "
+                    "set, COMLINK_USERNAME (the default sender) must be one of its entries."
+                )
+        else:
+            self.username = addresses[0]
+        if len(addresses) > 1 and self.password is not None:
+            raise ValueError(
+                "COMLINK_PASSWORD cannot serve several addresses. Supply one credential "
+                "per address with COMLINK_PASSWORD_DIR or COMLINK_PASSWORD_COMMAND."
+            )
+        return self
 
     @model_validator(mode="after")
     def _refuse_no_verify_off_localhost(self) -> ComlinkSettings:
@@ -156,12 +239,24 @@ class ComlinkSettings(BaseSettings):
         """Cloudflare Access signing-key (JWKS) endpoint for the configured team."""
         return f"https://{self.access_team_domain}/cdn-cgi/access/certs"
 
-    def resolve_password(self) -> str:
-        """Return the Bridge app password.
+    def account_addresses(self) -> list[str]:
+        """The configured addresses, normalized, in order.
 
-        ``COMLINK_PASSWORD_COMMAND`` wins over ``COMLINK_PASSWORD``: the command is run
-        through the shell and its stdout (stripped) is the password.
+        ``COMLINK_ACCOUNTS`` when set; otherwise ``COMLINK_USERNAME`` as a one-entry
+        list (empty when that is unset too).
         """
+        if self.accounts.strip():
+            return [normalize_address(item) for item in self.accounts.split(",")]
+        return [self.username] if self.username else []
+
+    def resolve_password(self, address: str | None = None) -> str:
+        """Return the Bridge app password for *address* (default: ``COMLINK_USERNAME``).
+
+        Precedence: ``COMLINK_PASSWORD_COMMAND`` (run through the shell, stdout
+        stripped, with the address in ``COMLINK_ACCOUNT``), then a file in
+        ``COMLINK_PASSWORD_DIR``, then ``COMLINK_PASSWORD`` (one address only).
+        """
+        address = address if address is not None else self.username
         if self.password_command:
             try:
                 # Shell execution is intentional: the command is operator-supplied
@@ -173,6 +268,7 @@ class ComlinkSettings(BaseSettings):
                     text=True,
                     timeout=_PASSWORD_COMMAND_TIMEOUT_SECONDS,
                     check=False,
+                    env={**os.environ, ACCOUNT_ENV_VAR: address},
                 )
             except subprocess.TimeoutExpired as exc:
                 raise ConfigError(
@@ -202,6 +298,8 @@ class ComlinkSettings(BaseSettings):
                     "the Bridge app password to stdout."
                 )
             return password
+        if self.password_dir is not None:
+            return self._read_password_file(address)
         if self.password is not None and self.password.get_secret_value():
             return self.password.get_secret_value()
         raise ConfigError(
@@ -209,6 +307,37 @@ class ComlinkSettings(BaseSettings):
             "Keychain lookup) or COMLINK_PASSWORD to the Bridge app password — not the "
             "Proton account password."
         )
+
+    def _read_password_file(self, address: str) -> str:
+        assert self.password_dir is not None
+        if not _ADDRESS_RE.match(normalize_address(address)):
+            raise ConfigError("Refusing to build a password filename from a malformed address.")
+        path = self.password_dir / password_filename(address)
+        try:
+            password = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConfigError(
+                f"No readable password file for {address} in COMLINK_PASSWORD_DIR "
+                f"(expected a file named {password_filename(address)})."
+            ) from exc
+        if not password:
+            raise ConfigError(
+                f"The password file for {address} in COMLINK_PASSWORD_DIR is empty "
+                f"({password_filename(address)})."
+            )
+        return password
+
+    def redaction_password(self, address: str) -> str | None:
+        """*address*'s resolved password for redaction, resolved at most once.
+
+        Best-effort: ``None`` when it cannot be resolved (that failure is cached too).
+        """
+        if address not in self._redaction_secrets:
+            try:
+                self._redaction_secrets[address] = self.resolve_password(address)
+            except Exception:  # redaction must never raise on resolution failure
+                self._redaction_secrets[address] = None
+        return self._redaction_secrets[address]
 
     def _raw_password(self) -> str | None:
         return self.password.get_secret_value() if self.password is not None else None

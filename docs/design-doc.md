@@ -21,7 +21,7 @@ An MCP server that gives Claude full mailbox capability against a Proton Mail ac
 - Calendar/contacts (Bridge doesn't expose them)
 - Attachment *download to disk* (metadata only in v1; fetch is a v2 candidate)
 - Thread reconstruction (IMAP threading via Bridge is unreliable; defer)
-- Multi-account / split-address mode (single combined-mode account in v1)
+- ~~Multi-account / split-address mode~~ — lifted by comlink#13; see §5 "Split address mode". (Send from any address is comlink#14; until then drafts and send stay on `COMLINK_USERNAME`.)
 - Serving Dispatch (`agent@chaosbit.dev`) — different account, different trust model; revisit after v1 ships
 
 ---
@@ -50,6 +50,8 @@ An MCP server that gives Claude full mailbox capability against a Proton Mail ac
 **Phase 2 (deferred, design only):** Comlink runs as a container on Gonk K3s with `transport="streamable-http"`, pointed at the already-running headless Bridge on Gonk. The target is a **remote MCP server reachable from the Claude mobile app / claude.ai**, which requires a **public HTTPS endpoint** (Traefik route + cert) fronted by **OAuth**, with the token scoped to Brandon's own identity. A tailnet is *not* reachable from the Claude mobile app, so the earlier "tailnet-only" model was wrong for this target and has been corrected here. Same codebase, transport selected by env var; the streamable-http transport and the OAuth resource-server token validation are themselves deferred implementation work (see Epic 5).
 
 **Phase 2 threat model.** Because the server is reachable by an authenticated *remote* session that reads attacker-controlled email content, the live threat is **email-borne prompt injection of Brandon's own authenticated session** into send/move/delete actions. OAuth proves *identity* but cannot stop *model-level* injection — a hostile email read inside a legitimately authenticated session is still hostile. What bounds the blast radius is structural, not the login: the **send gate** (env flag → allowlist → confirm → rate limit) and **Trash-only deletes** (never EXPUNGE). The OAuth layer must do real **audience-bound, scoped resource-server token validation** — not merely an edge login — and that property must be verified when the transport epic lands.
+
+**Split address mode widens this** (comlink#13): the same authenticated session, injected or compromised, can now read and organize every configured address — including kamino@ (the bot's GitHub mail: token and sign-in notices), security@, conduct@ and admin@ — not just brandon@. Sending is unchanged by that issue; see §7.6.
 
 ---
 
@@ -120,6 +122,8 @@ All via env vars (Pydantic Settings, prefix `COMLINK_`). No secrets ever logged.
 | `COMLINK_USERNAME` | — | Bridge username |
 | `COMLINK_PASSWORD` | — | Bridge app password (NOT Proton password) |
 | `COMLINK_PASSWORD_COMMAND` | — | Preferred over the above. Shell command whose stdout is the password, e.g. `security find-generic-password -s proton-bridge -w` (macOS Keychain) or `bw get password proton-bridge` (Vaultwarden). Wins if both set. |
+| `COMLINK_ACCOUNTS` | — | Split address mode: explicit, comma-separated list of Bridge addresses (never discovered). Unset ⇒ `COMLINK_USERNAME` is a one-entry list and nothing changes. See below. |
+| `COMLINK_PASSWORD_DIR` | — | Directory of mounted files, one password per address, named by the mapping below. Used after `COMLINK_PASSWORD_COMMAND`, before `COMLINK_PASSWORD`. |
 | `COMLINK_TLS_MODE` | `verify` | `verify` \| `no-verify` (localhost only) |
 | `COMLINK_TLS_CERT_PATH` | — | Pinned Bridge cert for `verify` mode |
 | `COMLINK_SMTP_SECURITY` | `starttls` | `starttls` (connect plaintext, upgrade in-band) \| `ssl` (implicit TLS on connect — for a Bridge SMTP endpoint configured with SSL) |
@@ -128,6 +132,18 @@ All via env vars (Pydantic Settings, prefix `COMLINK_`). No secrets ever logged.
 | `COMLINK_SEND_MAX_PER_HOUR` | `5` | Sliding-window rate limit |
 | `COMLINK_AUDIT_LOG` | `~/.comlink/audit.jsonl` | Append-only JSONL of every send + delete |
 | `COMLINK_TRANSPORT` | `stdio` | `stdio` \| `streamable-http` (Phase 2) |
+
+### Split address mode
+
+The Bridge on gonk runs in split address mode: each address has its own Bridge username (the address) and password, and a login sees only that address's mailbox. `COMLINK_ACCOUNTS=brandon@chaosbit.dev,kamino@chaosbit.dev,…` lists the addresses Comlink serves.
+
+- **Validation.** Entries are lowercased; duplicates and anything outside `[a-z0-9._-]+@[a-z0-9.-]+` are refused at startup, so an address can never carry shell metacharacters or path separators. `COMLINK_USERNAME`, if set, must be a listed address (it stays the default sender for drafts/send); if unset it defaults to the first entry. `COMLINK_PASSWORD` (one shared password) is refused with several addresses.
+- **Credentials, one per address.** `COMLINK_PASSWORD_COMMAND` runs once per address with the address in the **`COMLINK_ACCOUNT` environment variable** — never substituted into the shell string. `COMLINK_PASSWORD_DIR` holds one file per address; Kubernetes Secret keys allow only `[-._a-zA-Z0-9]`, so `@` maps to `_at_`: `kamino@chaosbit.dev` → `kamino_at_chaosbit.dev` (domains cannot contain `_`, so the mapping is collision-free). Error redaction (`_raw_secrets`, `resolve_password` stderr) covers every address's secret; health output never carries a credential.
+- **Connections.** One lazy `ImapConnectionManager` per address, each with its own lock and reconnect-after-Bridge-abort behaviour. One address failing to log in does not affect the others; `proton_health_check` reports each address under `accounts` (omitted with a single address).
+- **Why `address` is an explicit parameter, not a compound id.** A UID is unique only within its address's mailbox, so every per-message and per-mailbox tool (`list_folders`, `get_message`, `move/mark/delete_messages`, `create_folder`) takes `address`. With one address it is optional; with several, a missing or unknown `address` is **refused, never guessed** — acting on the wrong mailbox is worse than an error. Keeping `uid` a plain integer leaves single-address tool output and inputs unchanged.
+- **Fan-out.** `list_messages` and `search_messages` without `address` query every address and merge newest-first (ties: configured address order, then UID, so offsets are stable). Every result carries its `address`. The 250-result cap applies to the merged list and a page never exceeds `limit`; `capped` reports truncation. A failing address is listed under `errors`, not fatal. With several addresses configured, results (including explicit-address ones) carry `address`; with one, output is byte-for-byte unchanged.
+- **Folders are per address** (list, create, move target): each tool call acts inside one address's folder tree, so the design holds whether Bridge shows one tree per account or per address. *Open — operator to record after merge:* which of the two the live Bridge does (`proton_list_folders` per address).
+- **Out of scope here:** send from any address (comlink#14: one global allowlist and hourly cap). Drafts and send use `COMLINK_USERNAME`'s account.
 
 ---
 
@@ -193,7 +209,8 @@ Verifies IMAP + SMTP connectivity, reports Bridge reachability, account, folder 
 3. **Destructive ops are soft.** Delete = move to Trash; Trash and Spam are protected from further deletion; no EXPUNGE anywhere in the codebase.
 4. **Credentials:** password via command (Keychain/Vaultwarden) preferred; never logged, never echoed in errors; redaction helper in `errors.py` scrubs the password from any exception text before it leaves the server.
 5. **Audit trail:** sends and deletes append to JSONL with enough detail to reconstruct what an agent did and when.
-6. **TLS:** `no-verify` refused for non-localhost hosts at config-validation time.
+6. **Split address mode widens the trust boundary.** Whoever passes Cloudflare Access to Comlink can read and organize (move, mark, soft-delete, create folders in) *every* configured address, not just brandon@: kamino@ (the bot's GitHub mail, including token and sign-in notices), security@, conduct@, oss@, hello@ and admin@. A compromised Access identity or a prompt-injected client therefore reaches those mailboxes, and mail there can trigger account recovery or sign-in flows. Mitigations: the address list is explicit config (adding one is a deliberate change plus a credential), per-address credentials, read-only mode, soft deletes with audit, and the Access email allowlist. List only addresses that need to be served.
+7. **TLS:** `no-verify` refused for non-localhost hosts at config-validation time.
 
 ---
 

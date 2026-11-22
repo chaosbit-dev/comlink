@@ -163,8 +163,10 @@ def build_search_criteria(
 class ImapConnectionManager:
     """Lazy, lock-serialized, thread-offloaded IMAP connection to the Bridge."""
 
-    def __init__(self, settings: ComlinkSettings) -> None:
+    def __init__(self, settings: ComlinkSettings, address: str | None = None) -> None:
         self._settings = settings
+        # The Bridge login (split address mode: one manager, one login per address).
+        self._address = address if address is not None else settings.username
         self._lock = anyio.Lock()
         self._client: Any | None = None
         self._password: str | None = None
@@ -194,13 +196,13 @@ class ImapConnectionManager:
         if self._client is not None:
             return self._client
         settings = self._settings
-        if not settings.username:
+        if not self._address:
             raise ConfigError(
                 "COMLINK_USERNAME is not set. Set it to the Bridge username shown in "
                 "Bridge → Mailbox details."
             )
         if self._password is None:
-            self._password = settings.resolve_password()
+            self._password = settings.resolve_password(self._address)
         try:
             client = IMAPClient(settings.imap_host, port=settings.imap_port, ssl=False, timeout=15)
         except OSError as exc:
@@ -209,7 +211,7 @@ class ImapConnectionManager:
             ) from exc
         try:
             client.starttls(settings.build_ssl_context())
-            client.login(settings.username, self._password)
+            client.login(self._address, self._password)
         except LoginError as exc:
             self._shutdown_quietly(client)
             raise AuthFailed.imap() from exc

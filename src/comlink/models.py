@@ -157,6 +157,14 @@ class EndpointStatus(ComlinkModel):
     error: str | None = None
 
 
+class AccountHealth(ComlinkModel):
+    """One address's IMAP health in split address mode (never carries a credential)."""
+
+    address: str
+    imap: EndpointStatus
+    folder_count: int | None = None
+
+
 class HealthReport(ComlinkModel):
     """proton_health_check output (§6 Diagnostics)."""
 
@@ -169,6 +177,9 @@ class HealthReport(ComlinkModel):
     smtp: EndpointStatus | None = None
     account: str
     folder_count: int | None = None
+    # Split address mode only: per-address IMAP health. Removed from the output when a
+    # single address is configured, so that output is unchanged.
+    accounts: list[AccountHealth] | None = None
     # When true, only the five read tools are registered; all write/organize/
     # compose tools (including the send gate) are invisible to the client (§7.1
     # registration-time gating, mirrored for read-only mode).

@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
+from comlink.accounts import AccountPool
 from comlink.bridge import smtp
 from comlink.bridge.imap import ImapConnectionManager, MarkAction, build_search_criteria
 from comlink.bridge.parsing import (
@@ -34,6 +37,7 @@ from comlink.guardrails import (
     send_audit_entry,
 )
 from comlink.models import (
+    AccountHealth,
     DraftCreated,
     EndpointStatus,
     FolderCreated,
@@ -89,7 +93,8 @@ def _raw_secrets(settings: ComlinkSettings) -> list[str | None]:
     """Every secret string to scrub from a surfaced error (§7.4).
 
     Includes the static COMLINK_PASSWORD *and* the COMLINK_PASSWORD_COMMAND-derived
-    secret — at parity with ImapConnectionManager._secrets. When the credential comes
+    (or COMLINK_PASSWORD_DIR file) secret of every configured address — at parity with
+    ImapConnectionManager._secrets. When the credential comes
     from a command, settings.password is None, so without resolving the command the
     redaction set would be empty and a Bridge that echoes the password in an error
     could leak it. Resolution is best-effort: any failure is swallowed so the
@@ -98,11 +103,10 @@ def _raw_secrets(settings: ComlinkSettings) -> list[str | None]:
     secrets: list[str | None] = [
         settings.password.get_secret_value() if settings.password else None
     ]
-    if settings.password_command:
-        try:
-            secrets.append(settings.resolve_password())
-        except Exception:  # best-effort: redaction must never raise on resolution failure
-            logger.debug("Could not resolve COMLINK_PASSWORD_COMMAND for error redaction")
+    if settings.password_command or settings.password_dir is not None:
+        # Split-address mode: every configured address has its own credential.
+        for address in settings.account_addresses() or [settings.username]:
+            secrets.append(settings.redaction_password(address))
     return secrets
 
 
@@ -112,17 +116,51 @@ def _raw_secrets(settings: ComlinkSettings) -> list[str | None]:
 # ---------------------------------------------------------------------------
 
 
-async def health_check_impl(
-    settings: ComlinkSettings, imap: ImapConnectionManager, rate_limiter: RateLimiter
-) -> dict[str, Any]:
-    folder_count: int | None = None
+async def _probe_imap(
+    settings: ComlinkSettings, imap: ImapConnectionManager
+) -> tuple[EndpointStatus, int | None]:
     try:
-        folder_count = await imap.verify_connectivity()
-        imap_status = EndpointStatus(ok=True)
+        return EndpointStatus(ok=True), await imap.verify_connectivity()
     except ComlinkError as exc:
-        imap_status = EndpointStatus(ok=False, error=str(exc))
+        return EndpointStatus(ok=False, error=str(exc)), None
     except Exception as exc:  # health check must report, not crash
-        imap_status = EndpointStatus(ok=False, error=redacted_message(exc, _raw_secrets(settings)))
+        status = EndpointStatus(ok=False, error=redacted_message(exc, _raw_secrets(settings)))
+        return status, None
+
+
+async def health_check_impl(
+    settings: ComlinkSettings,
+    imap: ImapConnectionManager,
+    rate_limiter: RateLimiter,
+    *,
+    pool: AccountPool | None = None,
+) -> dict[str, Any]:
+    accounts: list[AccountHealth] | None = None
+    if pool is not None and pool.multi:
+        # Split-address mode: probe every address; one failing never hides the others.
+        probed: dict[str, tuple[EndpointStatus, int | None]] = {}
+
+        async def probe(address: str, manager: ImapConnectionManager) -> None:
+            probed[address] = await _probe_imap(settings, manager)
+
+        async with anyio.create_task_group() as group:
+            for address, manager in pool.items():
+                group.start_soon(probe, address, manager)
+        accounts = [
+            AccountHealth(address=address, imap=probed[address][0], folder_count=probed[address][1])
+            for address in pool.addresses
+        ]
+        failed = [entry for entry in accounts if not entry.imap.ok]
+        imap_status = EndpointStatus(
+            ok=not failed,
+            error=(f"{len(failed)} of {len(accounts)} addresses failed IMAP" if failed else None),
+        )
+        # Reachable if any address answered: one bad login is not a Bridge outage.
+        imap_reachable = len(failed) < len(accounts)
+        folder_count = None
+    else:
+        imap_status, folder_count = await _probe_imap(settings, imap)
+        imap_reachable = imap_status.ok
 
     # In read-only mode no send tool is registered, so SMTP is never exercised —
     # probing it surfaces a misleading failure on an otherwise-healthy deploy. Skip
@@ -131,7 +169,7 @@ async def health_check_impl(
     smtp_status: EndpointStatus | None
     if settings.read_only:
         smtp_status = None
-        bridge_reachable = imap_status.ok
+        bridge_reachable = imap_reachable
     else:
         try:
             password = settings.resolve_password()
@@ -143,13 +181,18 @@ async def health_check_impl(
             smtp_status = EndpointStatus(
                 ok=False, error=redacted_message(exc, _raw_secrets(settings))
             )
-        bridge_reachable = imap_status.ok or smtp_status.ok
+        bridge_reachable = imap_reachable or smtp_status.ok
 
     report = HealthReport(
         bridge_reachable=bridge_reachable,
         imap=imap_status,
         smtp=smtp_status,
-        account=settings.username or "(COMLINK_USERNAME not set)",
+        account=(
+            ", ".join(accounts_names(accounts))
+            if accounts
+            else settings.username or "(COMLINK_USERNAME not set)"
+        ),
+        accounts=accounts,
         folder_count=folder_count,
         read_only=settings.read_only,
         send_gate=SendGateStatus(
@@ -161,7 +204,15 @@ async def health_check_impl(
             ),
         ),
     )
-    return report.model_dump()
+    payload = report.model_dump()
+    if accounts is None:
+        # Single-address output is unchanged: no per-address section.
+        del payload["accounts"]
+    return payload
+
+
+def accounts_names(accounts: list[AccountHealth]) -> list[str]:
+    return [entry.address for entry in accounts]
 
 
 async def list_folders_impl(imap: ImapConnectionManager) -> dict[str, Any]:
@@ -207,6 +258,34 @@ async def list_messages_impl(
     }
 
 
+def _search_criteria(
+    query: str | None,
+    from_: str | None,
+    to: str | None,
+    subject: str | None,
+    since: str | None,
+    before: str | None,
+    unread_only: bool,
+    flagged_only: bool,
+) -> list[Any]:
+    if not any([query, from_, to, subject, since, before, unread_only, flagged_only]):
+        raise ComlinkError(
+            "proton_search_messages needs at least one criterion (query, from_, to, "
+            "subject, since, before, unread_only, or flagged_only). To browse a folder, "
+            "use proton_list_messages instead."
+        )
+    return build_search_criteria(
+        query=query,
+        from_=from_,
+        to=to,
+        subject=subject,
+        since=since,
+        before=before,
+        unread_only=unread_only,
+        flagged_only=flagged_only,
+    )
+
+
 async def search_messages_impl(
     imap: ImapConnectionManager,
     *,
@@ -222,23 +301,8 @@ async def search_messages_impl(
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
 ) -> dict[str, Any]:
-    if not any([query, from_, to, subject, since, before, unread_only, flagged_only]):
-        raise ComlinkError(
-            "proton_search_messages needs at least one criterion (query, from_, to, "
-            "subject, since, before, unread_only, or flagged_only). To browse a folder, "
-            "use proton_list_messages instead."
-        )
     limit, offset = clamp_pagination(limit, offset)
-    criteria = build_search_criteria(
-        query=query,
-        from_=from_,
-        to=to,
-        subject=subject,
-        since=since,
-        before=before,
-        unread_only=unread_only,
-        flagged_only=flagged_only,
-    )
+    criteria = _search_criteria(query, from_, to, subject, since, before, unread_only, flagged_only)
     hits = await imap.search_mailboxes(criteria, folder=folder, cap=MAX_SEARCH_RESULTS)
     summaries: list[MessageSummary] = [
         summary_from_fetch(uid, clean_name, data) for clean_name, uid, data in hits
@@ -298,6 +362,180 @@ async def get_message_impl(
 
 
 # ---------------------------------------------------------------------------
+# Split address mode (several Bridge addresses behind one Comlink)
+# ---------------------------------------------------------------------------
+
+
+async def on_account(
+    pool: AccountPool,
+    address: str | None,
+    op: Callable[[ImapConnectionManager], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Run a per-address tool on one address; tag the result when several are configured.
+
+    A missing or unknown ``address`` is refused when several are configured — never
+    guessed (a UID is only meaningful within its own address's mailbox). With one
+    address the output is byte-for-byte what it was before split mode.
+    """
+    resolved, imap = pool.resolve(address)
+    payload = await op(imap)
+    if pool.multi:
+        payload["address"] = resolved
+    return payload
+
+
+def _tag_messages(pool: AccountPool, result: dict[str, Any], address: str | None) -> dict[str, Any]:
+    """Stamp each summary of a single-address list/search with its address (split mode)."""
+    if pool.multi:
+        resolved, _ = pool.resolve(address)
+        for message in result["messages"]:
+            message["address"] = resolved
+    return result
+
+
+async def _fan_out[T](
+    settings: ComlinkSettings,
+    pool: AccountPool,
+    op: Callable[[ImapConnectionManager], Awaitable[T]],
+) -> tuple[dict[str, T], list[dict[str, str]]]:
+    """Run *op* against every address; a failing address is reported, not fatal."""
+    results: dict[str, T] = {}
+    errors: dict[str, str] = {}
+
+    async def run(address: str, imap: ImapConnectionManager) -> None:
+        try:
+            results[address] = await op(imap)
+        except ComlinkError as exc:
+            errors[address] = str(exc)
+        except Exception as exc:  # one address must not break the others
+            errors[address] = redacted_message(exc, _raw_secrets(settings))
+
+    async with anyio.create_task_group() as group:
+        for address, imap in pool.items():
+            group.start_soon(run, address, imap)
+    # Configured order, whatever order the tasks finished in.
+    ordered = {address: results[address] for address in pool.addresses if address in results}
+    return ordered, [
+        {"address": address, "error": errors[address]}
+        for address in pool.addresses
+        if address in errors
+    ]
+
+
+def _merge_key(summary: MessageSummary, order: int, uid: int) -> tuple[float, int, int]:
+    # Newest first; ties broken by configured address order, then UID — a total order,
+    # so offsets are stable from page to page.
+    return (-_date_sort_key(summary.date), order, -uid)
+
+
+async def list_messages_fanout_impl(
+    settings: ComlinkSettings,
+    pool: AccountPool,
+    *,
+    folder: str = "INBOX",
+    unread_only: bool = False,
+    since: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """list_messages across every address, merged newest-first.
+
+    Each address contributes a FIXED window of its MAX_SEARCH_RESULTS highest UIDs
+    regardless of the page asked for, so every page is a slice of the same merged,
+    Date-sorted pool (a window that grew with the offset would reshuffle between
+    pages). Pages beyond MAX_SEARCH_RESULTS are unreachable, and ``capped`` says so.
+    """
+    limit, offset = clamp_pagination(limit, offset)
+    criteria = build_search_criteria(unread_only=unread_only, since=since)
+
+    async def op(imap: ImapConnectionManager) -> Any:
+        return await imap.fetch_summary_page(folder, criteria, limit=MAX_SEARCH_RESULTS, offset=0)
+
+    results, errors = await _fan_out(settings, pool, op)
+    total = 0
+    merged: list[tuple[tuple[float, int, int], str, MessageSummary]] = []
+    for order, (address, (clean_name, address_total, page)) in enumerate(results.items()):
+        total += address_total
+        for uid, data in page:
+            summary = summary_from_fetch(uid, clean_name, data)
+            merged.append((_merge_key(summary, order, uid), address, summary))
+    merged.sort(key=lambda item: item[0])
+    reachable = min(total, MAX_SEARCH_RESULTS)
+    page_items = merged[offset : offset + limit]
+    messages = []
+    for _key, address, summary in page_items:
+        message = summary.model_dump(by_alias=True)
+        message["address"] = address
+        messages.append(message)
+    return {
+        "untrusted_content": UNTRUSTED_SUMMARY_BANNER,
+        "folder": folder,
+        "total": total,
+        "result_cap": MAX_SEARCH_RESULTS,
+        "capped": total > MAX_SEARCH_RESULTS,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(messages) < reachable,
+        "addresses": pool.addresses,
+        "errors": errors,
+        "messages": messages,
+    }
+
+
+async def search_messages_fanout_impl(
+    settings: ComlinkSettings,
+    pool: AccountPool,
+    *,
+    query: str | None = None,
+    from_: str | None = None,
+    to: str | None = None,
+    subject: str | None = None,
+    since: str | None = None,
+    before: str | None = None,
+    unread_only: bool = False,
+    flagged_only: bool = False,
+    folder: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """search_messages across every address: one merged, capped, newest-first list."""
+    criteria = _search_criteria(query, from_, to, subject, since, before, unread_only, flagged_only)
+    limit, offset = clamp_pagination(limit, offset)
+
+    async def op(imap: ImapConnectionManager) -> Any:
+        return await imap.search_mailboxes(criteria, folder=folder, cap=MAX_SEARCH_RESULTS)
+
+    results, errors = await _fan_out(settings, pool, op)
+    merged: list[tuple[tuple[float, int, int], str, MessageSummary]] = []
+    for order, (address, hits) in enumerate(results.items()):
+        for clean_name, uid, data in hits:
+            summary = summary_from_fetch(uid, clean_name, data)
+            merged.append((_merge_key(summary, order, uid), address, summary))
+    merged.sort(key=lambda item: item[0])
+    found = len(merged)
+    kept = merged[:MAX_SEARCH_RESULTS]
+    page = kept[offset : offset + limit]
+    messages = []
+    for _key, address, summary in page:
+        message = summary.model_dump(by_alias=True)
+        message["address"] = address
+        messages.append(message)
+    return {
+        "untrusted_content": UNTRUSTED_SUMMARY_BANNER,
+        "total_found": len(kept),
+        "result_cap": MAX_SEARCH_RESULTS,
+        "capped": found >= MAX_SEARCH_RESULTS,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(page) < len(kept),
+        "scope": folder if folder is not None else "all real folders (All Mail excluded)",
+        "addresses": pool.addresses,
+        "errors": errors,
+        "messages": messages,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Organize impls (Epic 2, §6)
 # ---------------------------------------------------------------------------
 
@@ -346,6 +584,7 @@ async def delete_messages_impl(
     *,
     uids: list[int],
     folder: str,
+    address: str | None = None,
 ) -> dict[str, Any]:
     _require_uids(uids)
     # move_to_trash raises (no audit entry) when refusing a protected source (§7.3).
@@ -358,6 +597,7 @@ async def delete_messages_impl(
             result.succeeded,
             [item.uid for item in result.failed],
             transport=settings.transport,
+            address=address,
         ),
     )
     payload = result.model_dump()
@@ -639,7 +879,9 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             "Proton client)."
         ),
     )
-    imap = ImapConnectionManager(settings)
+    pool = AccountPool(settings)
+    # Drafts and send stay on the default account (send from any address: comlink#14).
+    imap = pool.primary
     # One process-lifetime rate limiter shared by the send tool and the health
     # check (§7.1). A per-call limiter would silently disable the limit.
     rate_limiter = RateLimiter()
@@ -669,16 +911,18 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
     async def proton_health_check() -> str:
         """Verify IMAP + SMTP connectivity to Proton Mail Bridge. Reports Bridge
         reachability, account, folder count, and send-gate status."""
-        return _dump(await health_check_impl(settings, imap, rate_limiter))
+        return _dump(await health_check_impl(settings, imap, rate_limiter, pool=pool))
 
     @mcp.tool(annotations=_READ_ONLY)
-    async def proton_list_folders() -> str:
+    async def proton_list_folders(address: str | None = None) -> str:
         """List all mailboxes with clean name, kind (folder/label/system),
-        message count, and unread count."""
-        return _dump(await list_folders_impl(imap))
+        message count, and unread count. `address` selects the Bridge address
+        (required when several are configured)."""
+        return _dump(await on_account(pool, address, list_folders_impl))
 
     @mcp.tool(annotations=_READ_ONLY)
     async def proton_list_messages(
+        address: str | None = None,
         folder: str = "INBOX",
         unread_only: bool = False,
         since: str | None = None,
@@ -688,21 +932,38 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
         """List message envelope summaries in a folder, newest first.
 
         `since` is an ISO date (e.g. 2026-06-01). `limit` max 100; page with
-        `offset`.
+        `offset`. With several addresses configured, omit `address` to list the
+        folder across all of them (each message carries its `address`).
         """
-        return _dump(
-            await list_messages_impl(
-                imap,
+        if pool.multi and not (address and address.strip()):
+            return _dump(
+                await list_messages_fanout_impl(
+                    settings,
+                    pool,
+                    folder=folder,
+                    unread_only=unread_only,
+                    since=since,
+                    limit=limit,
+                    offset=offset,
+                )
+            )
+
+        async def op(manager: ImapConnectionManager) -> dict[str, Any]:
+            result = await list_messages_impl(
+                manager,
                 folder=folder,
                 unread_only=unread_only,
                 since=since,
                 limit=limit,
                 offset=offset,
             )
-        )
+            return _tag_messages(pool, result, address)
+
+        return _dump(await on_account(pool, address, op))
 
     @mcp.tool(annotations=_READ_ONLY)
     async def proton_search_messages(
+        address: str | None = None,
         query: str | None = None,
         from_: str | None = None,
         to: str | None = None,
@@ -720,11 +981,31 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
         By default searches all real folders (All Mail is excluded to avoid
         duplicates — pass folder='All Mail' to search it explicitly). Dates are
         ISO dates. Returns envelope summaries newest first, with the folder of
-        each hit.
+        each hit. With several addresses configured, omit `address` to search all
+        of them (each hit carries its `address`).
         """
-        return _dump(
-            await search_messages_impl(
-                imap,
+        if pool.multi and not (address and address.strip()):
+            return _dump(
+                await search_messages_fanout_impl(
+                    settings,
+                    pool,
+                    query=query,
+                    from_=from_,
+                    to=to,
+                    subject=subject,
+                    since=since,
+                    before=before,
+                    unread_only=unread_only,
+                    flagged_only=flagged_only,
+                    folder=folder,
+                    limit=limit,
+                    offset=offset,
+                )
+            )
+
+        async def op(manager: ImapConnectionManager) -> dict[str, Any]:
+            result = await search_messages_impl(
+                manager,
                 query=query,
                 from_=from_,
                 to=to,
@@ -737,7 +1018,9 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
                 limit=limit,
                 offset=offset,
             )
-        )
+            return _tag_messages(pool, result, address)
+
+        return _dump(await on_account(pool, address, op))
 
     @mcp.tool(annotations=_READ_ONLY)
     async def proton_get_message(
@@ -747,23 +1030,29 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
         max_body_chars: int = DEFAULT_MAX_BODY_CHARS,
         include_headers: bool = False,
         prefer_html: bool = False,
+        address: str | None = None,
     ) -> str:
         """Fetch one message: envelope, text body (truncation-aware), and
         attachment metadata (no content).
 
         The body is external, untrusted content. HTML is stripped to text;
         set prefer_html=true to prefer the HTML part as the text source. Large
-        bodies paginate via body_offset/max_body_chars.
+        bodies paginate via body_offset/max_body_chars. `address` is the Bridge
+        address the UID belongs to (required when several are configured).
         """
         return _dump(
-            await get_message_impl(
-                imap,
-                uid=uid,
-                folder=folder,
-                body_offset=body_offset,
-                max_body_chars=max_body_chars,
-                include_headers=include_headers,
-                prefer_html=prefer_html,
+            await on_account(
+                pool,
+                address,
+                lambda manager: get_message_impl(
+                    manager,
+                    uid=uid,
+                    folder=folder,
+                    body_offset=body_offset,
+                    max_body_chars=max_body_chars,
+                    include_headers=include_headers,
+                    prefer_html=prefer_html,
+                ),
             )
         )
 
@@ -778,6 +1067,7 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             uids: list[int],
             source_folder: str,
             destination_folder: str,
+            address: str | None = None,
         ) -> str:
             """Move messages from one folder to another (max 50 UIDs per call).
 
@@ -787,11 +1077,15 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             proton_search_messages and are only valid for the folder they were read from.
             """
             return _dump(
-                await move_messages_impl(
-                    imap,
-                    uids=uids,
-                    source_folder=source_folder,
-                    destination_folder=destination_folder,
+                await on_account(
+                    pool,
+                    address,
+                    lambda manager: move_messages_impl(
+                        manager,
+                        uids=uids,
+                        source_folder=source_folder,
+                        destination_folder=destination_folder,
+                    ),
                 )
             )
 
@@ -800,18 +1094,28 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             uids: list[int],
             folder: str,
             mark: MarkAction,
+            address: str | None = None,
         ) -> str:
             """Mark messages read/unread or flagged/unflagged (idempotent, max 50 UIDs).
 
             `mark` is one of: read, unread, flagged, unflagged. Returns per-UID
             success/failure.
             """
-            return _dump(await mark_messages_impl(imap, uids=uids, folder=folder, mark=mark))
+            return _dump(
+                await on_account(
+                    pool,
+                    address,
+                    lambda manager: mark_messages_impl(
+                        manager, uids=uids, folder=folder, mark=mark
+                    ),
+                )
+            )
 
         @mcp.tool(annotations=_DESTRUCTIVE)
         async def proton_delete_messages(
             uids: list[int],
             folder: str,
+            address: str | None = None,
         ) -> str:
             """Delete messages by moving them to Trash (max 50 UIDs per call).
 
@@ -819,20 +1123,43 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             Trash or Spam is refused — empty those from a Proton client. Every delete
             is recorded in the audit log. Returns per-UID success/failure.
             """
-            return _dump(await delete_messages_impl(settings, imap, uids=uids, folder=folder))
+            resolved, _manager = pool.resolve(address)
+            return _dump(
+                await on_account(
+                    pool,
+                    address,
+                    lambda manager: delete_messages_impl(
+                        settings,
+                        manager,
+                        uids=uids,
+                        folder=folder,
+                        # Audit the address only in split mode (legacy entries unchanged).
+                        address=resolved if pool.multi else None,
+                    ),
+                )
+            )
 
         @mcp.tool()
         async def proton_create_folder(
             name: str,
             kind: Literal["folder", "label"] = "folder",
             parent: str | None = None,
+            address: str | None = None,
         ) -> str:
             """Create a folder or label under the correct Proton namespace.
 
             `kind` is 'folder' or 'label'. `parent` (folders only) nests the new
             folder under an existing folder; labels cannot be nested.
             """
-            return _dump(await create_folder_impl(imap, name=name, kind=kind, parent=parent))
+            return _dump(
+                await on_account(
+                    pool,
+                    address,
+                    lambda manager: create_folder_impl(
+                        manager, name=name, kind=kind, parent=parent
+                    ),
+                )
+            )
 
         @mcp.tool()
         async def proton_save_draft(
