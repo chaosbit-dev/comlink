@@ -206,7 +206,8 @@ class FakeManager:
     ) -> Any:
         if self.fail:
             raise self.fail
-        ordered = sorted(self.uids_dates, key=lambda p: (p[1], p[0]), reverse=True)
+        # Like the real client: newest by UID, whatever the Date header says.
+        ordered = sorted(self.uids_dates, key=lambda p: p[0], reverse=True)
         return (
             folder,
             len(ordered),
@@ -285,6 +286,22 @@ class TestFanOut:
             seen.extend((m["address"], m["uid"]) for m in out["messages"])
         assert len(seen) == 60 and len(set(seen)) == 60
         assert out["has_more"] is False
+
+    async def test_list_fanout_forged_date_not_hidden(self) -> None:
+        def forged() -> list[tuple[int, datetime]]:
+            return [(1, datetime(2099, 1, 1, tzinfo=UTC))] + [
+                (i, day(1 + i % 20)) for i in range(2, 41)
+            ]
+
+        settings, pool = fake_pool(
+            {ADDRS[0]: FakeManager(forged()), ADDRS[1]: FakeManager(forged())}
+        )
+        seen = []
+        for offset in range(0, 80, 10):
+            out = await list_messages_fanout_impl(settings, pool, limit=10, offset=offset)
+            seen.extend((m["address"], m["uid"]) for m in out["messages"])
+        assert len(seen) == 80 and len(set(seen)) == 80
+        assert (ADDRS[0], 1) in seen
 
     async def test_one_failing_address_leaves_others_working(self) -> None:
         settings, pool = fake_pool(
@@ -368,3 +385,39 @@ class TestToolSurface:
         tools = {t.name: t for t in await create_server(multi_settings()).list_tools()}
         for name in ("proton_get_message", "proton_list_messages", "proton_create_folder"):
             assert "address" in tools[name].input_schema["properties"]
+
+
+class TestReviewRound1:
+    def test_password_dir_refuses_path_traversal_username(self, tmp_path: Path) -> None:
+        with pytest.raises(ValidationError, match="plain address"):
+            make_settings(username="../secret", password=None, password_dir=tmp_path)
+
+    def test_redaction_resolves_command_once(self, tmp_path: Path) -> None:
+        counter = tmp_path / "n"
+        s = multi_settings(password_command=f'echo x >> {counter}; printf "pw-$COMLINK_ACCOUNT"')
+        _raw_secrets(s)
+        _raw_secrets(s)
+        assert len(counter.read_text().splitlines()) == len(ADDRS)
+
+    def test_delete_audit_entry_address_only_when_given(self) -> None:
+        from comlink.guardrails import delete_audit_entry
+
+        assert "address" not in delete_audit_entry("INBOX", [1], [])
+        assert delete_audit_entry("INBOX", [1], [], address=ADDRS[1])["address"] == ADDRS[1]
+
+    async def test_delete_tool_audits_address(self, tmp_path: Path) -> None:
+        from comlink.server import delete_messages_impl
+
+        class Mgr:
+            async def move_to_trash(self, folder: str, uids: list[int]) -> Any:
+                return SimpleNamespace(
+                    folder=folder,
+                    succeeded=uids,
+                    failed=[],
+                    model_dump=lambda: {"folder": folder},
+                )
+
+        settings = multi_settings(audit_log=tmp_path / "audit.jsonl")
+        await delete_messages_impl(settings, Mgr(), uids=[1], folder="INBOX", address=ADDRS[1])  # type: ignore[arg-type]
+        entry = json.loads((tmp_path / "audit.jsonl").read_text().splitlines()[-1])
+        assert entry["address"] == ADDRS[1]

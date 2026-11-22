@@ -45,6 +45,7 @@ def delete_audit_entry(
     succeeded: list[int],
     failed: list[int],
     transport: str = DEFAULT_TRANSPORT,
+    address: str | None = None,
 ) -> dict[str, Any]:
     """Build the delete audit entry. No secrets ever go in audit entries (§7.4).
 
@@ -54,7 +55,7 @@ def delete_audit_entry(
     ``principal`` is ``None`` under the stdio/local transport. A delete needs the same
     attribution as a send — an injected destructive action must be traceable.
     """
-    return {
+    entry: dict[str, Any] = {
         "ts": audit_timestamp(),
         "action": "delete",
         "transport": transport,
@@ -64,6 +65,11 @@ def delete_audit_entry(
         "succeeded": list(succeeded),
         "failed": list(failed),
     }
+    if address is not None:
+        # Split address mode: (folder, uids) is only meaningful within one address's
+        # mailbox. Absent for a single-address deployment, so its entries are unchanged.
+        entry["address"] = address
+    return entry
 
 
 def send_audit_entry(

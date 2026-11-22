@@ -106,10 +106,7 @@ def _raw_secrets(settings: ComlinkSettings) -> list[str | None]:
     if settings.password_command or settings.password_dir is not None:
         # Split-address mode: every configured address has its own credential.
         for address in settings.account_addresses() or [settings.username]:
-            try:
-                secrets.append(settings.resolve_password(address))
-            except Exception:  # best-effort: redaction must never raise on resolution failure
-                logger.debug("Could not resolve a configured credential for error redaction")
+            secrets.append(settings.redaction_password(address))
     return secrets
 
 
@@ -443,16 +440,16 @@ async def list_messages_fanout_impl(
 ) -> dict[str, Any]:
     """list_messages across every address, merged newest-first.
 
-    Each address contributes its newest ``offset + limit`` messages (at most
-    MAX_SEARCH_RESULTS), which is enough to compute any page of the merge exactly.
-    Pages beyond MAX_SEARCH_RESULTS are unreachable, and ``capped`` says so.
+    Each address contributes a FIXED window of its MAX_SEARCH_RESULTS highest UIDs
+    regardless of the page asked for, so every page is a slice of the same merged,
+    Date-sorted pool (a window that grew with the offset would reshuffle between
+    pages). Pages beyond MAX_SEARCH_RESULTS are unreachable, and ``capped`` says so.
     """
     limit, offset = clamp_pagination(limit, offset)
     criteria = build_search_criteria(unread_only=unread_only, since=since)
-    window = min(offset + limit, MAX_SEARCH_RESULTS)
 
     async def op(imap: ImapConnectionManager) -> Any:
-        return await imap.fetch_summary_page(folder, criteria, limit=window, offset=0)
+        return await imap.fetch_summary_page(folder, criteria, limit=MAX_SEARCH_RESULTS, offset=0)
 
     results, errors = await _fan_out(settings, pool, op)
     total = 0
@@ -587,6 +584,7 @@ async def delete_messages_impl(
     *,
     uids: list[int],
     folder: str,
+    address: str | None = None,
 ) -> dict[str, Any]:
     _require_uids(uids)
     # move_to_trash raises (no audit entry) when refusing a protected source (§7.3).
@@ -599,6 +597,7 @@ async def delete_messages_impl(
             result.succeeded,
             [item.uid for item in result.failed],
             transport=settings.transport,
+            address=address,
         ),
     )
     payload = result.model_dump()
@@ -1124,12 +1123,18 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             Trash or Spam is refused — empty those from a Proton client. Every delete
             is recorded in the audit log. Returns per-UID success/failure.
             """
+            resolved, _manager = pool.resolve(address)
             return _dump(
                 await on_account(
                     pool,
                     address,
                     lambda manager: delete_messages_impl(
-                        settings, manager, uids=uids, folder=folder
+                        settings,
+                        manager,
+                        uids=uids,
+                        folder=folder,
+                        # Audit the address only in split mode (legacy entries unchanged).
+                        address=resolved if pool.multi else None,
                     ),
                 )
             )

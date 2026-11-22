@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from comlink.errors import ConfigError, redact
@@ -84,6 +84,10 @@ class ComlinkSettings(BaseSettings):
 
     read_only: bool = False
 
+    # Resolved credentials kept for error redaction only (None = could not resolve), so
+    # redacting an error never re-runs a password command on the event loop.
+    _redaction_secrets: dict[str, str | None] = PrivateAttr(default_factory=dict)
+
     allow_send: bool = False
     send_allowlist: str = ""
     send_max_per_hour: int = 5
@@ -119,6 +123,20 @@ class ComlinkSettings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _validate_password_dir_username(self) -> ComlinkSettings:
+        """The username names a file in ``COMLINK_PASSWORD_DIR``; keep it a plain address."""
+        if (
+            self.password_dir is not None
+            and not self.accounts.strip()
+            and not _ADDRESS_RE.match(normalize_address(self.username))
+        ):
+            raise ValueError(
+                "COMLINK_PASSWORD_DIR requires COMLINK_USERNAME (or COMLINK_ACCOUNTS) to "
+                "be a plain address such as brandon@chaosbit.dev."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_accounts(self) -> ComlinkSettings:
@@ -292,6 +310,8 @@ class ComlinkSettings(BaseSettings):
 
     def _read_password_file(self, address: str) -> str:
         assert self.password_dir is not None
+        if not _ADDRESS_RE.match(normalize_address(address)):
+            raise ConfigError("Refusing to build a password filename from a malformed address.")
         path = self.password_dir / password_filename(address)
         try:
             password = path.read_text(encoding="utf-8").strip()
@@ -306,6 +326,18 @@ class ComlinkSettings(BaseSettings):
                 f"({password_filename(address)})."
             )
         return password
+
+    def redaction_password(self, address: str) -> str | None:
+        """*address*'s resolved password for redaction, resolved at most once.
+
+        Best-effort: ``None`` when it cannot be resolved (that failure is cached too).
+        """
+        if address not in self._redaction_secrets:
+            try:
+                self._redaction_secrets[address] = self.resolve_password(address)
+            except Exception:  # redaction must never raise on resolution failure
+                self._redaction_secrets[address] = None
+        return self._redaction_secrets[address]
 
     def _raw_password(self) -> str | None:
         return self.password.get_secret_value() if self.password is not None else None
