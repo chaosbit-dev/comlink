@@ -20,6 +20,8 @@ name: build-and-push
 on:
   push:
     branches: [main]
+  # Build-only (no push, no credentials): proves the image still builds.
+  pull_request:
   # Manual rebuild of main, e.g. after registry damage (gonk-infra#877).
   workflow_dispatch:
 
@@ -30,20 +32,42 @@ jobs:
   # GATE. Flux selects the newest tag on its own, so an unconditional push
   # means a red build reaches the cluster unattended (2026-09-18, mcp 2.x).
   check:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     uses: ./.github/workflows/ci.yml
 
+  # PRs (including forks) only prove the image builds: nothing is pushed.
+  pr-build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+
+  # Only the default branch publishes: a dispatch on any other ref must not
+  # reach the tag stream Flux deploys from.
   build:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
       id-token: write # keyless signing
-      attestations: write
     env:
       IMAGE: ghcr.io/chaosbit-dev/comlink
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Image metadata (sortable tag)
         id: meta
@@ -66,6 +90,7 @@ jobs:
           push: true
           sbom: true
           provenance: mode=max
+          labels: org.opencontainers.image.source=https://github.com/chaosbit-dev/comlink
           tags: ghcr.io/chaosbit-dev/comlink:main-${{ steps.meta.outputs.sha7 }}-${{ steps.meta.outputs.ts }}
 
       # Built from source at a fixed, go.sum-verified version rather than via a
@@ -75,5 +100,20 @@ jobs:
 
       - name: Sign image (keyless)
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      # Re-publish the BuildKit SBOM and provenance as cosign attestations, so
+      # `cosign verify-attestation` works against the signing identity.
+      - name: Attest SBOM and provenance (keyless)
+        run: |
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" \
+            --format '{{ json .SBOM.SPDX }}' > "${RUNNER_TEMP}/sbom.spdx.json"
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" \
+            --format '{{ json .Provenance.SLSA }}' > "${RUNNER_TEMP}/provenance.json"
+          cosign attest --yes --type spdxjson \
+            --predicate "${RUNNER_TEMP}/sbom.spdx.json" "${IMAGE}@${DIGEST}"
+          cosign attest --yes --type slsaprovenance \
+            --predicate "${RUNNER_TEMP}/provenance.json" "${IMAGE}@${DIGEST}"
         env:
           DIGEST: ${{ steps.build.outputs.digest }}

@@ -29,6 +29,8 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "ruff>=0.6.0",
     "mypy>=1.11.0",
+    "pyyaml>=6.0.3",
+    "types-pyyaml>=6.0.12.20261113",
 ]
 
 [build-system]
