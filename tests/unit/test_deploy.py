@@ -93,8 +93,29 @@ def test_signs_and_attests() -> None:
     runs = _run_text(PUBLISH)
     assert "cosign sign" in runs
     assert "cosign attest" in runs
-    assert "--type spdxjson" in runs
-    assert "--type slsaprovenance" in runs
+    assert "--type spdxjson --predicate sbom.spdx.json" in runs
+    # v1 provenance, exactly: "slsaprovenance" alone would also match the older predicate type.
+    assert "--type slsaprovenance1 --predicate provenance.json" in runs
+    # Signed attestations only: BuildKit's own SBOM/provenance are unsigned.
+    build_step = next(s for s in _steps(PUBLISH) if "build-push-action" in s.get("uses", ""))
+    assert "sbom" not in build_step["with"] and "provenance" not in build_step["with"]
+
+
+# The publish steps use the same pinned actions as chaosbit-dev/obsidian-git-mcp@0865acf.
+PINNED = {
+    "docker/login-action": "8aa5831fb8d48d8f76594c7ddde61ae58019f550",
+    "sigstore/cosign-installer": "756fe2d284c7292c4e9b62c8a28f1e5629c59532",
+    "anchore/sbom-action": "66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c",
+}
+
+
+def test_publish_steps_use_the_pinned_actions() -> None:
+    uses = [s["uses"] for s in _steps(PUBLISH) if "uses" in s]
+    for action, sha in PINNED.items():
+        assert f"{action}@{sha}" in uses, action
+    runs = _run_text(PUBLISH)
+    assert "go install" not in runs  # no cosign built from source
+    assert "docker login" not in runs  # login only through the pinned action
 
 
 def test_image_source_label() -> None:
