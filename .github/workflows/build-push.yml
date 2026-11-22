@@ -1,32 +1,18 @@
 # =============================================================================
-# Reference build-and-push workflow for Gonk image repos (GitOps / Flux model).
+# Build and publish the comlink image to GHCR.
 #
-# This is a TEMPLATE. Copy it into each image repo (comlink, homeassistant-mcp,
-# …) as .github/workflows/build-push.yml.
+# CI's ONLY job is to publish an immutable, signed artifact. It pushes
+# ghcr.io/chaosbit-dev/comlink with the run's own GITHUB_TOKEN. There is no
+# registry credential in this (public) repo, no `environment: release`, and no
+# cluster credentials: Flux on Gonk watches the registry, selects the newest
+# build by timestamp, rewrites the image tag in gonk-infra, and reconciles.
 #
-# CI's ONLY job is to publish an immutable artifact. It builds the image and
-# pushes it to registry.home.chaosbit.dev over an ephemeral tailnet join. It has
-# NO cluster credentials and NO write access to gonk-infra.
-#
-# Deployment is pull-based: Flux on Gonk watches the registry, selects the newest
-# build by timestamp, rewrites the image tag in gonk-infra, and reconciles. See
-# clusters/gonk/comlink*.yaml and the Flux runbook in the gonk-infra README.
-#
-# Tags pushed:
-#   :latest                  convenience / humans
-#   :<sha>                   immutable, for manual pinning / rollback
+# Tag pushed:
 #   :main-<sha7>-<unixts>    SORTABLE — this is what Flux's ImagePolicy ranks
-#                            (numerical on the timestamp). Without a sortable
-#                            tag Flux can't tell which image is newest.
+#                            (numerical on the timestamp).
 #
-# -----------------------------------------------------------------------------
-# Required GitHub secrets (org level, chaosbit-dev, scoped to this repo)
-# -----------------------------------------------------------------------------
-#   TS_OAUTH_CLIENT_ID   Tailscale OAuth client ID (tagged tag:ci).
-#   TS_OAUTH_SECRET      Tailscale OAuth client secret.
-#   REGISTRY_USERNAME    Registry user. Currently "ci".
-#   REGISTRY_PASSWORD    The `ci` bcrypt password (from scripts/registry-htpasswd.sh).
-# (No GONK_INFRA_DEPLOY_TOKEN and no kube credentials — Flux owns deploy.)
+# The image is signed keyless (cosign, GitHub OIDC) and carries an SBOM and
+# SLSA provenance attestation. Nothing is published on pull requests.
 # =============================================================================
 
 name: build-and-push
@@ -37,22 +23,25 @@ on:
   # Manual rebuild of main, e.g. after registry damage (gonk-infra#877).
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  # GATE. The template publishes unconditionally, which is fine for an image
-  # nobody auto-deploys — but Flux selects the newest tag on its own, so an
-  # unconditional push means a red build reaches the cluster unattended.
-  # That is not hypothetical: on 2026-09-18 an unmigrated mcp 2.x bump merged
-  # here, built green (a Docker build never imports the app), and Flux rolled
-  # it out. The gate costs ~20s and removes that path. Mirrors hk47.
+  # GATE. Flux selects the newest tag on its own, so an unconditional push
+  # means a red build reaches the cluster unattended (2026-09-18, mcp 2.x).
   check:
     uses: ./.github/workflows/ci.yml
 
   build:
-    # The registry and tailnet credentials live in the `release` environment, which only the default
-    # branch may use: a pushed branch's workflow can't read them (Kamino KAMINO-FLOW-BOOT-012).
-    environment: release
     needs: check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless signing
+      attestations: write
+    env:
+      IMAGE: ghcr.io/chaosbit-dev/comlink
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -62,26 +51,29 @@ jobs:
           echo "sha7=$(echo "${GITHUB_SHA}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
           echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
 
-      - name: Join tailnet (ephemeral)
-        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
-
-      - name: Log in to registry
+      - name: Log in to GHCR
         run: |
-          echo "${{ secrets.REGISTRY_PASSWORD }}" \
-            | docker login registry.home.chaosbit.dev \
-                -u "${{ secrets.REGISTRY_USERNAME }}" \
-                --password-stdin
+          echo "${GITHUB_TOKEN}" \
+            | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: true
-          tags: |
-            registry.home.chaosbit.dev/${{ github.event.repository.name }}:latest
-            registry.home.chaosbit.dev/${{ github.event.repository.name }}:${{ github.sha }}
-            registry.home.chaosbit.dev/${{ github.event.repository.name }}:main-${{ steps.meta.outputs.sha7 }}-${{ steps.meta.outputs.ts }}
+          sbom: true
+          provenance: mode=max
+          tags: ghcr.io/chaosbit-dev/comlink:main-${{ steps.meta.outputs.sha7 }}-${{ steps.meta.outputs.ts }}
+
+      # Built from source at a fixed, go.sum-verified version rather than via a
+      # third-party action.
+      - name: Install cosign
+        run: go install github.com/sigstore/cosign/v2/cmd/cosign@v2.5.3
+
+      - name: Sign image (keyless)
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
