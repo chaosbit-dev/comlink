@@ -21,6 +21,9 @@ from comlink.guardrails import RateLimiter, send_audit_entry
 from comlink.server import send_message_impl
 
 from ..conftest import make_settings
+from .from_variants import from_variant_fixture
+
+_from_variant = from_variant_fixture()
 
 _PASSWORD = "br1dge-app-pw-zz"
 _BODY = "CONFIDENTIAL deal memo — do not forward."

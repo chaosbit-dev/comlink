@@ -723,11 +723,27 @@ def _sender(
     imap: ImapConnectionManager,
     pool: AccountPool | None,
     from_address: str | None,
-) -> tuple[str, ImapConnectionManager]:
-    """The From address and the mailbox (its manager) the draft/reply lives in."""
+    in_reply_to_address: str | None,
+    in_reply_to_uid: int | None,
+) -> tuple[str, ImapConnectionManager, ImapConnectionManager]:
+    """The From address, its mailbox (drafts) and the reply parent's mailbox.
+
+    The parent UID is looked up in ``in_reply_to_address``'s mailbox (default: the From
+    address's); UIDs are per mailbox, so the two can differ.
+    """
+    if in_reply_to_address is not None and in_reply_to_uid is None:
+        raise ComlinkError(
+            "in_reply_to_address only applies to a reply: pass in_reply_to_uid and "
+            "in_reply_to_folder too, or omit it."
+        )
     if pool is None:
-        return settings.username, imap
-    return pool.resolve_sender(from_address)
+        if from_address is not None or in_reply_to_address is not None:
+            raise ComlinkError(
+                "from_address and in_reply_to_address need the configured address pool."
+            )
+        return settings.username, imap, imap
+    sender, manager = pool.resolve_sender(from_address)
+    return sender, manager, pool.resolve_reply_parent(sender, manager, in_reply_to_address)
 
 
 async def save_draft_impl(
@@ -736,6 +752,7 @@ async def save_draft_impl(
     *,
     pool: AccountPool | None = None,
     from_address: str | None = None,
+    in_reply_to_address: str | None = None,
     to: list[str] | None = None,
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
@@ -745,12 +762,14 @@ async def save_draft_impl(
     in_reply_to_folder: str | None = None,
 ) -> dict[str, Any]:
     """Build an RFC 5322 message and APPEND it to the From address's Drafts."""
-    sender, imap = _sender(settings, imap, pool, from_address)
+    sender, imap, parent_imap = _sender(
+        settings, imap, pool, from_address, in_reply_to_address, in_reply_to_uid
+    )
     to, cc, bcc = list(to or []), list(cc or []), list(bcc or [])
     _validate_reply_params(in_reply_to_uid, in_reply_to_folder)
     _require_recipients(to, cc, bcc)
     message = await _build_outgoing(
-        imap,
+        parent_imap,
         from_addr=sender,
         to=to,
         cc=cc,
@@ -781,6 +800,7 @@ async def send_message_impl(
     *,
     pool: AccountPool | None = None,
     from_address: str | None = None,
+    in_reply_to_address: str | None = None,
     to: list[str] | None = None,
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
@@ -790,8 +810,8 @@ async def send_message_impl(
     in_reply_to_uid: int | None = None,
     in_reply_to_folder: str | None = None,
 ) -> dict[str, Any]:
-    """Gated send pipeline (§7): confirm → allowlist → rate-limit → SMTP send →
-    commit budget → audit. NEVER APPENDs to Sent (§3.6).
+    """Gated send pipeline (§7): confirm → From address (known, send-enabled) →
+    allowlist → rate-limit → SMTP send → commit budget → audit. NEVER APPENDs to Sent (§3.6).
     """
     # Layer-1 (env gate) is enforced at registration; here we enforce the
     # schema-required confirm at runtime as a belt-and-braces guard (Echo intel:
@@ -801,7 +821,9 @@ async def send_message_impl(
     # From address (split mode): refused when missing/unknown with several configured,
     # and when the address is marked read-only. The gate below is global, shared by
     # every From address.
-    sender, imap = _sender(settings, imap, pool, from_address)
+    sender, _imap, parent_imap = _sender(
+        settings, imap, pool, from_address, in_reply_to_address, in_reply_to_uid
+    )
     if not settings.send_allowed_from(sender):
         raise SendBlocked.address_read_only(sender)
     to, cc, bcc = list(to or []), list(cc or []), list(bcc or [])
@@ -818,7 +840,7 @@ async def send_message_impl(
     rate_limiter.reserve(now, settings.send_max_per_hour)
     try:
         message = await _build_outgoing(
-            imap,
+            parent_imap,
             from_addr=sender,
             to=to,
             cc=cc,
@@ -1202,6 +1224,7 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
         @mcp.tool()
         async def proton_save_draft(
             from_address: str | None = None,
+            in_reply_to_address: str | None = None,
             to: list[str] | None = None,
             cc: list[str] | None = None,
             bcc: list[str] | None = None,
@@ -1220,6 +1243,9 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             and a single 'Re:' subject are set for you. `from_address` is the
             configured address the draft is From and saved under (required when
             several are configured; a reply is saved under the replying address).
+            A UID is only valid in its own address's mailbox: `in_reply_to_address`
+            names the address whose mailbox holds the parent message (default: the
+            From address); it must be a configured address.
             Returns the new draft's UID and Message-ID.
             """
             return _dump(
@@ -1228,6 +1254,7 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
                     imap,
                     pool=pool,
                     from_address=from_address,
+                    in_reply_to_address=in_reply_to_address,
                     to=to,
                     cc=cc,
                     bcc=bcc,
@@ -1248,6 +1275,7 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
             async def proton_send_message(
                 confirm: bool,
                 from_address: str | None = None,
+                in_reply_to_address: str | None = None,
                 to: list[str] | None = None,
                 cc: list[str] | None = None,
                 bcc: list[str] | None = None,
@@ -1265,7 +1293,10 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
                 in_reply_to_uid and in_reply_to_folder. Proton saves the Sent copy
                 server-side. `from_address` is the configured address to send as
                 (required when several are configured, including for a reply; the
-                send gate is shared by all addresses). Returns the sent Message-ID
+                send gate is shared by all addresses). A UID is only valid in its
+                own address's mailbox: `in_reply_to_address` names the address whose
+                mailbox holds the parent message (default: the From address; it must
+                be a configured address). Returns the sent Message-ID
                 and recipients.
                 """
                 return _dump(
@@ -1275,6 +1306,7 @@ def create_server(settings: ComlinkSettings | None = None) -> MCPServer:
                         rate_limiter,
                         pool=pool,
                         from_address=from_address,
+                        in_reply_to_address=in_reply_to_address,
                         to=to,
                         cc=cc,
                         bcc=bcc,

@@ -281,3 +281,149 @@ class TestAudit:
         with pytest.raises(SendBlocked):
             await send(settings, pool, RateLimiter(), from_address=HELLO)
         assert not settings.audit_log.exists()
+
+
+PARENT = (
+    b"From: x@example.com\r\nTo: y@chaosbit.dev\r\nSubject: Original\r\n"
+    b"Message-ID: <parent@example.com>\r\n\r\nhi\r\n"
+)
+
+
+class ParentManager(FakeManager):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.fetched: list[tuple[str, int]] = []
+
+    async def fetch_raw_message(self, folder: str, uid: int) -> tuple[str, bytes, Any]:
+        self.fetched.append((folder, uid))
+        return folder, PARENT, ()
+
+
+class TestCrossAddressReply:
+    def _pool(self, settings: ComlinkSettings) -> tuple[AccountPool, dict[str, ParentManager]]:
+        fakes = {a: ParentManager(a) for a in settings.account_addresses()}
+        return AccountPool(settings, managers=fakes), fakes  # type: ignore[arg-type]
+
+    async def test_default_looks_up_parent_in_from_mailbox(
+        self, tmp_path: Path, sent: list[dict[str, Any]]
+    ) -> None:
+        settings = multi(tmp_path)
+        pool, fakes = self._pool(settings)
+        await send(
+            settings,
+            pool,
+            RateLimiter(),
+            from_address=HELLO,
+            in_reply_to_uid=3,
+            in_reply_to_folder="INBOX",
+        )
+        assert fakes[HELLO].fetched == [("INBOX", 3)]
+        assert not fakes[BRANDON].fetched
+
+    async def test_explicit_parent_address_used_for_lookup(
+        self, tmp_path: Path, sent: list[dict[str, Any]]
+    ) -> None:
+        settings = multi(tmp_path)
+        pool, fakes = self._pool(settings)
+        await send(
+            settings,
+            pool,
+            RateLimiter(),
+            from_address=HELLO,
+            in_reply_to_address=BRANDON,
+            in_reply_to_uid=3,
+            in_reply_to_folder="INBOX",
+        )
+        assert fakes[BRANDON].fetched == [("INBOX", 3)]
+        assert not fakes[HELLO].fetched
+        assert sent[0]["message"]["From"] == HELLO
+        assert sent[0]["message"]["In-Reply-To"] == "<parent@example.com>"
+
+    async def test_draft_uses_parent_address_but_saves_under_from(self, tmp_path: Path) -> None:
+        settings = multi(tmp_path)
+        pool, fakes = self._pool(settings)
+        await save_draft_impl(
+            settings,
+            pool.primary,
+            pool=pool,
+            from_address=HELLO,
+            in_reply_to_address=BRANDON,
+            to=["a@chaosbit.dev"],
+            in_reply_to_uid=3,
+            in_reply_to_folder="INBOX",
+        )
+        assert fakes[BRANDON].fetched == [("INBOX", 3)]
+        assert len(fakes[HELLO].appended) == 1
+        assert not fakes[BRANDON].appended
+
+    async def test_unconfigured_parent_address_refused(
+        self, tmp_path: Path, sent: list[dict[str, Any]]
+    ) -> None:
+        settings = multi(tmp_path)
+        pool, fakes = self._pool(settings)
+        with pytest.raises(ComlinkError, match="Unknown address"):
+            await send(
+                settings,
+                pool,
+                RateLimiter(),
+                from_address=HELLO,
+                in_reply_to_address="ceo@chaosbit.dev",
+                in_reply_to_uid=3,
+                in_reply_to_folder="INBOX",
+            )
+        assert sent == []
+        assert all(not f.fetched for f in fakes.values())
+
+    async def test_parent_address_without_reply_refused(
+        self, tmp_path: Path, sent: list[dict[str, Any]]
+    ) -> None:
+        settings = multi(tmp_path)
+        pool, _ = make_pool(settings)
+        with pytest.raises(ComlinkError, match="only applies to a reply"):
+            await send(
+                settings, pool, RateLimiter(), from_address=HELLO, in_reply_to_address=BRANDON
+            )
+        assert sent == []
+
+
+class TestLegacySingleAddress:
+    async def test_username_spelling_kept(self, sent: list[dict[str, Any]]) -> None:
+        settings = make_settings(username="Hello@Chaosbit.dev", send_allowlist="*@chaosbit.dev")
+        pool, _ = make_pool(settings)
+        await send(settings, pool, RateLimiter())
+        assert sent[0]["message"]["From"] == "Hello@Chaosbit.dev"
+        assert sent[0]["username"] == "Hello@Chaosbit.dev"
+
+    async def test_from_address_without_pool_refused(self, sent: list[dict[str, Any]]) -> None:
+        settings = make_settings(username=HELLO, send_allowlist="*@chaosbit.dev")
+        with pytest.raises(ComlinkError, match="address pool"):
+            await send_message_impl(
+                settings,
+                object(),  # type: ignore[arg-type]
+                RateLimiter(),
+                from_address=HELLO,
+                to=["alice@chaosbit.dev"],
+                confirm=True,
+            )
+        assert sent == []
+
+
+class TestAllowlistAnchoring:
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "a@evil-chaosbit.dev",
+            "a@chaosbit.dev.evil.com",
+            "a@evil.chaosbit.dev",
+            "Trusted <evil@attacker.com>",
+            "alice@chaosbit.dev,evil@attacker.com",
+        ],
+    )
+    async def test_anchoring_for_non_default_from(
+        self, tmp_path: Path, sent: list[dict[str, Any]], bad: str
+    ) -> None:
+        settings = multi(tmp_path)
+        pool, _ = make_pool(settings)
+        with pytest.raises(SendBlocked):
+            await send(settings, pool, RateLimiter(), from_address=HELLO, to=[bad])
+        assert sent == []
