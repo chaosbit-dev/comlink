@@ -42,7 +42,11 @@ def test_no_secrets_or_release_environment() -> None:
         doc = yaml.safe_load(path.read_text())
         assert "secrets." not in str(doc), path.name
         for job in doc["jobs"].values():
-            assert "environment" not in job, path.name
+            env = job.get("environment")
+            name = env.get("name") if isinstance(env, dict) else env
+            # github-pages is the one environment allowed: it holds no secrets, and its branch
+            # policy is what stops a run from any branch but main deploying Pages.
+            assert env is None or name == "github-pages", path.name
 
 
 def test_packages_write_only_on_the_publish_job() -> None:
