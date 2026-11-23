@@ -4,6 +4,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/chaosbit-dev/comlink/build-push.yml?branch=main&label=CI)](https://github.com/chaosbit-dev/comlink/actions/workflows/build-push.yml)
 [![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fchaosbit-dev%2Fcomlink%2Fmain%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v)](pyproject.toml)
 [![Python](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2Fchaosbit-dev%2Fcomlink%2Fmain%2Fpyproject.toml)](pyproject.toml)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fchaosbit-dev.github.io%2Fcomlink%2Fcoverage.json)](.github/workflows/coverage.yml)
 
 Comlink is a **Proton Mail MCP server**. It gives Claude full mailbox capability —
 read, search, triage, organize, draft, and (gated) send — by talking to **Proton Mail

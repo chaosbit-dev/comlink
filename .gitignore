@@ -32,3 +32,4 @@ htmlcov/
 
 # Cloudflare Access app config backups (local only — contain infra config)
 experiments/auth_probe/*app_backup.json
+coverage-report.json

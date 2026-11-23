@@ -1,0 +1,109 @@
+# =============================================================================
+# Coverage badge, self-hosted: no Codecov, no extra token.
+#
+# On every push to main this measures test coverage and publishes a shields.io
+# endpoint JSON to this repo's GitHub Pages site; the README badge reads
+# https://chaosbit-dev.github.io/<repo>/coverage.json.
+#
+# Pages, not a badges branch: the `branches` ruleset lets only org admins
+# create or update branches other than main and kamino/**, so GITHUB_TOKEN
+# could not push one. A Pages deployment needs no branch at all.
+#
+# Three jobs, so that neither the deploy permissions nor the published content
+# can be shaped by repository or PyPI code:
+#   measure  contents: read     installs deps, runs the tests, uploads the raw
+#                               coverage report
+#   badge    (no permissions)   no checkout, no deps: reads one number from the
+#                               report and writes the badge JSON, the only file
+#                               in the Pages artifact
+#   deploy   pages: write,      no checkout, no run steps: deploys that artifact
+#            id-token: write
+#
+# GitHub-hosted runners only: public repos never run on self-hosted runners.
+# No pull_request trigger, so a fork PR never reaches the deploy job.
+# =============================================================================
+
+name: coverage
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+# One deployment at a time. Never cancel a run already deploying (a half-done
+# Pages deployment shows red); a queued run still collapses to the newest main.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Tests with coverage
+        run: uv run pytest -q --cov=comlink --cov-report=term --cov-report=json:coverage-report.json
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-report
+          path: coverage-report.json
+          retention-days: 1
+
+  badge:
+    needs: measure
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-report
+
+      - name: Build the badge JSON
+        run: |
+          mkdir site
+          python3 - <<'EOF'
+          import json
+          pct = round(float(json.load(open("coverage-report.json"))["totals"]["percent_covered"]))
+          if not 0 <= pct <= 100:
+              raise SystemExit(f"coverage out of range: {pct}")
+          color = next(c for floor, c in ((90, "brightgreen"), (80, "green"), (70, "yellowgreen"),
+                                          (60, "yellow"), (50, "orange"), (0, "red")) if pct >= floor)
+          badge = {"schemaVersion": 1, "label": "coverage", "message": f"{pct}%", "color": color}
+          json.dump(badge, open("site/coverage.json", "w"))
+          print(badge)
+          EOF
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+          retention-days: 1
+
+  deploy:
+    needs: badge
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}coverage.json
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
