@@ -9,11 +9,15 @@
 # create or update branches other than main and kamino/**, so GITHUB_TOKEN
 # could not push one. A Pages deployment needs no branch at all.
 #
-# Two jobs so that the deploy permissions never meet repository or PyPI code:
-#   measure  contents: read               installs deps, runs the tests,
-#                                          uploads the badge as a Pages artifact
-#   deploy   pages: write, id-token: write never checks out the repo; deploys
-#                                          that artifact and nothing else
+# Three jobs, so that neither the deploy permissions nor the published content
+# can be shaped by repository or PyPI code:
+#   measure  contents: read     installs deps, runs the tests, uploads the raw
+#                               coverage report
+#   badge    (no permissions)   no checkout, no deps: reads one number from the
+#                               report and writes the badge JSON, the only file
+#                               in the Pages artifact
+#   deploy   pages: write,      no checkout, no run steps: deploys that artifact
+#            id-token: write
 #
 # GitHub-hosted runners only: public repos never run on self-hosted runners.
 # No pull_request trigger, so a fork PR never reaches the deploy job.
@@ -28,10 +32,11 @@ on:
 
 permissions: {}
 
-# One deployment at a time; a queued run measures a newer main, so let it win.
+# One deployment at a time. Never cancel a run already deploying (a half-done
+# Pages deployment shows red); a queued run still collapses to the newest main.
 concurrency:
-  group: coverage
-  cancel-in-progress: true
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   measure:
@@ -54,15 +59,32 @@ jobs:
       - name: Tests with coverage
         run: uv run pytest -q --cov=comlink --cov-report=term --cov-report=json:coverage-report.json
 
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-report
+          path: coverage-report.json
+          retention-days: 1
+
+  badge:
+    needs: measure
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-report
+
       - name: Build the badge JSON
         run: |
-          mkdir -p site
+          mkdir site
           python3 - <<'EOF'
           import json
-          pct = json.load(open("coverage-report.json"))["totals"]["percent_covered"]
+          pct = round(float(json.load(open("coverage-report.json"))["totals"]["percent_covered"]))
+          if not 0 <= pct <= 100:
+              raise SystemExit(f"coverage out of range: {pct}")
           color = next(c for floor, c in ((90, "brightgreen"), (80, "green"), (70, "yellowgreen"),
                                           (60, "yellow"), (50, "orange"), (0, "red")) if pct >= floor)
-          badge = {"schemaVersion": 1, "label": "coverage", "message": f"{pct:.0f}%", "color": color}
+          badge = {"schemaVersion": 1, "label": "coverage", "message": f"{pct}%", "color": color}
           json.dump(badge, open("site/coverage.json", "w"))
           print(badge)
           EOF
@@ -73,7 +95,7 @@ jobs:
           retention-days: 1
 
   deploy:
-    needs: measure
+    needs: badge
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
