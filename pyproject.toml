@@ -31,6 +31,7 @@ dev = [
     "mypy>=1.11.0",
     "pyyaml>=6.0.3",
     "types-pyyaml>=6.0.12.20261113",
+    "pytest-cov>=7.1.0",
 ]
 
 [build-system]

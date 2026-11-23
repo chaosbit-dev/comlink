@@ -1,0 +1,87 @@
+# =============================================================================
+# Coverage badge, self-hosted: no Codecov, no extra token.
+#
+# On every push to main this measures test coverage and publishes a shields.io
+# endpoint JSON to this repo's GitHub Pages site; the README badge reads
+# https://chaosbit-dev.github.io/<repo>/coverage.json.
+#
+# Pages, not a badges branch: the `branches` ruleset lets only org admins
+# create or update branches other than main and kamino/**, so GITHUB_TOKEN
+# could not push one. A Pages deployment needs no branch at all.
+#
+# Two jobs so that the deploy permissions never meet repository or PyPI code:
+#   measure  contents: read               installs deps, runs the tests,
+#                                          uploads the badge as a Pages artifact
+#   deploy   pages: write, id-token: write never checks out the repo; deploys
+#                                          that artifact and nothing else
+#
+# GitHub-hosted runners only: public repos never run on self-hosted runners.
+# No pull_request trigger, so a fork PR never reaches the deploy job.
+# =============================================================================
+
+name: coverage
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+# One deployment at a time; a queued run measures a newer main, so let it win.
+concurrency:
+  group: coverage
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Tests with coverage
+        run: uv run pytest -q --cov=comlink --cov-report=term --cov-report=json:coverage-report.json
+
+      - name: Build the badge JSON
+        run: |
+          mkdir -p site
+          python3 - <<'EOF'
+          import json
+          pct = json.load(open("coverage-report.json"))["totals"]["percent_covered"]
+          color = next(c for floor, c in ((90, "brightgreen"), (80, "green"), (70, "yellowgreen"),
+                                          (60, "yellow"), (50, "orange"), (0, "red")) if pct >= floor)
+          badge = {"schemaVersion": 1, "label": "coverage", "message": f"{pct:.0f}%", "color": color}
+          json.dump(badge, open("site/coverage.json", "w"))
+          print(badge)
+          EOF
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+          retention-days: 1
+
+  deploy:
+    needs: measure
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}coverage.json
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
