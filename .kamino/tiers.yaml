@@ -1,0 +1,7 @@
+# This repository's tier map (KAMINO-FLOW-TIER-001, -003). The merge controller and `kamino merge-check`
+# read it from `main` only. The first pattern a path matches decides its tier; a path no pattern names is tier 1.
+version: 1
+patterns:
+  # Warranty ceiling (kamino#481): every path is tier 2 until the post-cutover warranty ends, so the merge
+  # controller merges only tier 0 on its own. Delete this file after the warranty.
+  - {pattern: "**", tier: 2}
